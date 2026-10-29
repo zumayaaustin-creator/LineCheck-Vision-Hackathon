@@ -139,12 +139,76 @@ handling and `?simulate=401` proves auth-failure handling - two different paths 
 
 ---
 
+---
+
+## Proxy server - keeping the key out of the browser
+
+`harness/proxy-server.mjs` holds the Meta credential server-side and forwards the two routes
+the HUD needs. **This is the recommended path for anything real**, because Vite inlines every
+`VITE_*` value into the browser bundle - a key in `VITE_META_API_KEY` is public.
+
+```bash
+META_API_KEY=sk-... \
+META_SAM_URL=https://api.example.com/sam-3.1/segment \
+META_MUSE_URL=https://api.example.com/muse-audio/transcribe \
+node harness/proxy-server.mjs                     # http://127.0.0.1:8790
+```
+
+Rehearse the whole chain with no internet and no key of value:
+
+```bash
+UPSTREAM_BASE=http://127.0.0.1:8787 META_API_KEY=local-test-token \
+MAX_PAID_CALLS=60 node harness/proxy-server.mjs
+```
+
+Then the browser config needs **no credential at all**:
+
+```
+VITE_USE_MOCK_META=false
+VITE_USE_PROXY=true
+VITE_SAM_MODEL_ENDPOINT=http://127.0.0.1:8791/sam-3.1/segment
+VITE_MUSE_AUDIO_ENDPOINT=http://127.0.0.1:8791/muse-audio/transcribe
+```
+
+`VITE_USE_PROXY=true` tells the client that the missing key is correct rather than a
+misconfiguration - without it `shouldUseMock()` would refuse to leave the mock path.
+
+**Cost guard:** `MAX_PAID_CALLS` (default 60) is a hard ceiling. Past it the proxy returns
+`429 paid_call_cap_reached` and refuses to forward. `GET /__usage` shows
+`{paidCalls, maxPaidCalls, remaining}`.
+
+Other knobs: `PROXY_PORT`, `PROXY_TIMEOUT_MS` (30 s), `PROXY_ALLOWED_ORIGINS` (CORS allowlist).
+
+---
+
+## Microphone capture
+
+`harness/webmcp/src/mic.ts` records one bounded window (2.2 s) via `getUserMedia` +
+`MediaRecorder`, then releases the device. Same rule as SAM: one wake event, one call - never an
+always-on stream.
+
+Every failure resolves to a readable message and the HUD falls back to a synthetic audio Blob, so
+the voice path stays testable on machines with no mic:
+
+| failure | message |
+|---|---|
+| `NotAllowedError` | `microphone permission denied` |
+| `NotFoundError` | `no microphone device found` |
+| `NotReadableError` | `microphone is in use by another application` |
+
+Verified in a headless browser with no device permission: it logged
+`mic unavailable (microphone permission denied) - using synthetic audio` and still completed the
+Muse -> WebMCP tool call.
+
+---
+
 ## Keyboard harness (in the HUD)
 
 | key | action |
 |---|---|
 | `S` | one SAM 3.1 snapshot (mock or live, depending on `VITE_USE_MOCK_META`) |
 | `V` | one Muse voice utterance -> resolves to a WebMCP tool -> executes it |
+| `M` | same as `V` but captures from the real microphone first |
 | `1` | `tare_scale` |
 | `2` | `calculate_yield` |
 | `3` | `verify_pan_depth` (15% -> warning) |

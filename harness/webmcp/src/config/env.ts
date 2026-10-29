@@ -19,6 +19,12 @@ function isExplicitlyOff(v: string | undefined): boolean {
 export const env = {
   /** true unless explicitly disabled */
   useMockMeta: !isExplicitlyOff(raw.VITE_USE_MOCK_META),
+  /**
+   * Proxy mode: the browser calls a server-side proxy (see harness/proxy-server.mjs) that
+   * holds the credential. No key belongs in this bundle, so requiring one here would
+   * wrongly force the mock path.
+   */
+  useProxy: raw.VITE_USE_PROXY === 'true',
   metaApiKey: raw.VITE_META_API_KEY ?? '',
   samEndpoint: raw.VITE_SAM_MODEL_ENDPOINT ?? '',
   museEndpoint: raw.VITE_MUSE_AUDIO_ENDPOINT ?? '',
@@ -34,13 +40,17 @@ export const env = {
  * configured. Never returns false just because a flag was set.
  */
 export function shouldUseMock(): boolean {
-  return env.useMockMeta || !env.metaApiKey || !env.samEndpoint;
+  if (env.useMockMeta) return true;
+  if (!env.samEndpoint) return true;
+  // in proxy mode the credential lives server-side, so its absence here is correct
+  if (!env.useProxy && !env.metaApiKey) return true;
+  return false;
 }
 
 /** Human-readable reason, surfaced in the HUD so a mock run is never mistaken for live. */
 export function mockReason(): string | null {
   if (env.useMockMeta) return 'VITE_USE_MOCK_META';
-  if (!env.metaApiKey) return 'no VITE_META_API_KEY';
   if (!env.samEndpoint) return 'no VITE_SAM_MODEL_ENDPOINT';
+  if (!env.useProxy && !env.metaApiKey) return 'no VITE_META_API_KEY';
   return null;
 }

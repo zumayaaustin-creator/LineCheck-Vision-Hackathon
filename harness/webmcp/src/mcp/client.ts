@@ -73,7 +73,8 @@ export class MetaModelClient {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${env.metaApiKey}`,
+          // proxy mode: the proxy injects the credential, so none is sent from the browser
+          ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
         },
         body: JSON.stringify({ frame: imageDataBase64, width: this.frame.width, height: this.frame.height }),
       });
@@ -120,7 +121,7 @@ export class MetaModelClient {
 
     const response = await fetch(env.museEndpoint, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${env.metaApiKey}` },
+      headers: env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {},
       body,
     });
     if (!response.ok) throw new Error(`Muse HTTP ${response.status}`);

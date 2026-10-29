@@ -3,6 +3,7 @@ import { executeTool } from './mcp/tools';
 import { metaClient } from './mcp/client';
 import { normalizeToHud } from './mcp/normalize';
 import { shouldUseMock, mockReason, HUD_SIZE } from './config/env';
+import { captureUtterance, micSupported } from './mic';
 
 const canvas =
   document.querySelector<HTMLCanvasElement>('#hud-canvas') ||
@@ -132,8 +133,25 @@ async function triggerVoice(hint?: string) {
   voiceInFlight = true;
   hudStore.setStatus('LISTENING');
   try {
-    const audio = new Blob([new Uint8Array(2048)], { type: 'audio/wav' });
+    // Real microphone when the browser allows it; the synthetic Blob keeps the
+    // Muse -> WebMCP path testable on machines with no mic (and in headless runs).
+    let audio: Blob;
+    let captured = false;
+    if (micSupported()) {
+      try {
+        audio = await captureUtterance({ durationMs: 2200 });
+        captured = true;
+        console.log(`[HUD] mic captured ${(audio.size / 1024).toFixed(1)} KB`);
+      } catch (micErr) {
+        console.warn(`[HUD] mic unavailable (${(micErr as Error).message}) - using synthetic audio`);
+        audio = new Blob([new Uint8Array(2048)], { type: 'audio/wav' });
+      }
+    } else {
+      audio = new Blob([new Uint8Array(2048)], { type: 'audio/wav' });
+    }
+
     const result = await metaClient.processKitchenQuery(audio, hint);
+    if (captured) console.log('[HUD] voice used real microphone audio');
     console.log(`[HUD] voice (${result.source}): "${result.transcription}"`);
 
     if (result.toolCall) {
@@ -153,6 +171,18 @@ async function triggerVoice(hint?: string) {
 
 (window as any).triggerVoice = triggerVoice;
 
+/** explicit microphone entry point, surfaced so the capture path can be tested directly */
+async function triggerMic() {
+  if (!micSupported()) {
+    console.warn('[HUD] mic unsupported in this context');
+    return;
+  }
+  console.log('[HUD] mic: capturing 2.2s...');
+  await triggerVoice();
+}
+
+(window as any).triggerMic = triggerMic;
+
 // Keyboard Test Harness
 window.addEventListener('keydown', async (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -165,6 +195,10 @@ window.addEventListener('keydown', async (e) => {
     case 'v':
     case 'V':
       await triggerVoice();
+      break;
+    case 'm':
+    case 'M':
+      await triggerMic();
       break;
     case '1':
       console.log('[HUD] tare_scale');
