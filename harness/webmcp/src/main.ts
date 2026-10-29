@@ -4,6 +4,7 @@ import { metaClient } from './mcp/client';
 import { normalizeToHud } from './mcp/normalize';
 import { shouldUseMock, mockReason, HUD_SIZE } from './config/env';
 import { captureUtterance, micSupported } from './mic';
+import { runHudSelfTest } from './selftest';
 
 const canvas =
   document.querySelector<HTMLCanvasElement>('#hud-canvas') ||
@@ -77,6 +78,8 @@ render();
 (window as any).metaClient = metaClient;
 // exposed so the coordinate contract can be checked from the console / an e2e pass
 (window as any).normalizeToHud = normalizeToHud;
+// coordinate-contract self-test, runnable from the console or CI with no test runner
+(window as any).runHudSelfTest = runHudSelfTest;
 
 /**
  * Snapshot: the ONLY path that can hit SAM 3.1.
