@@ -1,29 +1,42 @@
 import { hudStore, Reticle } from './hud/state';
 import { executeTool } from './mcp/tools';
+import { metaClient } from './mcp/client';
+import { normalizeToHud } from './mcp/normalize';
+import { shouldUseMock, mockReason, HUD_SIZE } from './config/env';
 
-const canvas = document.querySelector<HTMLCanvasElement>('#hud-canvas') || document.querySelector<HTMLCanvasElement>('canvas');
+const canvas =
+  document.querySelector<HTMLCanvasElement>('#hud-canvas') ||
+  document.querySelector<HTMLCanvasElement>('canvas');
 if (!canvas) {
   console.error('[HUD] Canvas element not found!');
 }
 
 const ctx = canvas?.getContext('2d');
 if (canvas) {
-  canvas.width = 600;
-  canvas.height = 600;
+  canvas.width = HUD_SIZE;
+  canvas.height = HUD_SIZE;
 }
 
+/**
+ * Draw loop. This is pure rendering of current state: it must never call the Meta API.
+ * SAM 3.1 is snapshot-only (see triggerSnapshot) so an animation frame can never spend
+ * credits.
+ */
 function render() {
   if (!ctx || !canvas) return;
-  ctx.clearRect(0, 0, 600, 600);
+  ctx.clearRect(0, 0, HUD_SIZE, HUD_SIZE);
 
-  // The store is private state + a getter, so read a snapshot per frame
   const state = hudStore.getState();
 
-  // Status banner. The HTML header occupies canvas-space y 12-31, so drawing at y=25
-  // put this text underneath the title. Move it clear of the header.
+  // Status banner. The HTML header occupies canvas-space y 12-31, so this sits below it.
   ctx.font = '10px monospace';
   ctx.fillStyle = state.status === 'ALERT' ? '#BD00FF' : '#00F0FF';
   ctx.fillText(`STATUS: ${state.status}`, 20, 48);
+
+  // Mock/live indicator, so a mock run is never mistaken for a live one
+  const mock = shouldUseMock();
+  ctx.fillStyle = mock ? '#FCEE0A' : '#00F0FF';
+  ctx.fillText(`SAM 3.1: ${mock ? `MOCK (${mockReason() ?? 'default'})` : 'LIVE'}`, 20, 62);
 
   // Draw Reticles
   state.reticles.forEach((r: Reticle) => {
@@ -50,12 +63,60 @@ render();
 // Console exposure
 (window as any).executeTool = executeTool;
 (window as any).hudStore = hudStore;
+(window as any).metaClient = metaClient;
+// exposed so the coordinate contract can be checked from the console / an e2e pass
+(window as any).normalizeToHud = normalizeToHud;
+
+/**
+ * Snapshot: the ONLY path that can hit SAM 3.1.
+ * Guarded so repeated presses cannot stack calls; the client also throttles internally.
+ */
+let snapshotInFlight = false;
+let lastSnapshotAt = 0;
+
+async function triggerSnapshot() {
+  const now = Date.now();
+  if (snapshotInFlight) {
+    console.log('[HUD] snapshot ignored: call already in flight');
+    return;
+  }
+  if (now - lastSnapshotAt < 400) {
+    console.log('[HUD] snapshot ignored: debounced');
+    return;
+  }
+  snapshotInFlight = true;
+  lastSnapshotAt = now;
+  hudStore.setStatus('PROCESSING');
+
+  try {
+    const result = await metaClient.analyzeFrame();
+    const breach = result.containers.some((c) => c.status === 'breach');
+    const warn = result.containers.some((c) => c.status === 'warning');
+
+    hudStore.setReticles(result.containers);
+    hudStore.setStatus(breach ? 'ALERT' : warn ? 'ALERT' : 'IDLE');
+
+    if (result.throttled) console.log('[HUD] snapshot throttled by client, showing last result');
+    console.log(`[HUD] snapshot: ${result.source} -> ${result.containers.length} containers`);
+  } catch (err) {
+    console.error('[HUD] snapshot failed:', err);
+    hudStore.setStatus('IDLE');
+  } finally {
+    snapshotInFlight = false;
+  }
+}
+
+(window as any).triggerSnapshot = triggerSnapshot;
 
 // Keyboard Test Harness
 window.addEventListener('keydown', async (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
   switch (e.key) {
+    case 's':
+    case 'S':
+      await triggerSnapshot();
+      break;
     case '1':
       console.log('[HUD] tare_scale');
       await executeTool('tare_scale', { unit: 'g' });

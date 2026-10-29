@@ -19,5 +19,6 @@ export interface ContainerTarget {
   confidence: number;
   /** Estimated fill level 0..100, for pan/prep-container checks */
   fillPercentage?: number;
-  status?: ReticleStatus;
+  /** Resolved by the adapter, never optional: the HUD must always know how to colour it */
+  status: ReticleStatus;
 }
