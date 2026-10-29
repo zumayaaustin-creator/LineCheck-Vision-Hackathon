@@ -169,8 +169,31 @@ const server = createServer(async (req, res) => {
         height: Number(body.height) || SOURCE_FRAME.height,
       };
       const payload = buildDetections(frame);
+
+      // A realistic billing block, so the proxy's reconciliation path has real fields to read.
+      // MOCK_USAGE_COST lets a test force a cost that differs from the proxy's reserved floor.
+      if (process.env.MOCK_USAGE !== 'off') {
+        const forced = process.env.MOCK_USAGE_COST;
+        const cost = forced !== undefined && forced !== ''
+          ? Number(forced)
+          : Number((0.0123 + Math.random() * 0.004).toFixed(6)); // deliberately != the $0.05 floor
+        payload.usage = {
+          // MOCK_USAGE_NO_COST=1 omits the explicit cost so the proxy's token maths can be tested
+          ...(process.env.MOCK_USAGE_NO_COST === '1' ? {} : { total_cost_usd: cost }),
+          prompt_tokens: 1180,
+          completion_tokens: 340,
+          duration_seconds: 1.42,
+          model: 'sam-3.1-mock',
+        };
+        payload.meta.usageIncluded = true;
+      }
+
       log(`#${n} sam-3.1 -> ${payload.detections.length} detections, frame ${frame.width}x${frame.height}, auth ok, body ${raw.length}B`);
-      json(res, 200, payload);
+      json(res, 200, payload, {
+        'x-ratelimit-limit-requests': '300',
+        'x-ratelimit-remaining-requests': String(300 - n),
+        'x-request-id': `mock-${n}`,
+      });
       return;
     }
 
@@ -181,6 +204,13 @@ const server = createServer(async (req, res) => {
       log(`#${n} muse-spark -> "${transcript.slice(0, 48)}" => ${out.tool.name} (conf ${out.confidence}) auth ok`);
       json(res, 200, {
         ...out,
+        usage: process.env.MOCK_USAGE === 'off' ? undefined : {
+          total_cost_usd: Number(process.env.MOCK_USAGE_COST ?? 0.0071),
+          prompt_tokens: 260,
+          completion_tokens: 48,
+          duration_seconds: 0.31,
+          model: 'muse-spark-1.3-mock',
+        },
         meta: { model: 'muse-spark-1.3-mock', toolsOffered: tools.length },
       });
       return;
@@ -195,6 +225,14 @@ const server = createServer(async (req, res) => {
       reply: t.reply,
       action: t.action,
       tool: t.tool,
+      usage: process.env.MOCK_USAGE === 'off' ? undefined : {
+        total_cost_usd: Number(process.env.MOCK_USAGE_COST ?? 0.0043),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        duration_seconds: Number((raw.length / 16000).toFixed(3)),
+        billed_seconds: Number((raw.length / 16000).toFixed(3)),
+        model: 'muse-voice-mock',
+      },
       meta: { model: 'muse-mock', scenario: t.scenario, audioBytes: raw.length },
     });
   } catch (err) {

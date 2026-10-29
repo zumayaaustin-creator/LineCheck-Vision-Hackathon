@@ -2,9 +2,11 @@ import { hudStore, Reticle } from './hud/state';
 import { executeTool, toolDefinitions } from './mcp/tools';
 import { metaClient } from './mcp/client';
 import { normalizeToHud } from './mcp/normalize';
-import { shouldUseMock, mockReason, HUD_SIZE } from './config/env';
+import { shouldUseMock, mockReason, HUD_SIZE, env } from './config/env';
 import { captureUtterance, micSupported } from './mic';
 import { runHudSelfTest } from './selftest';
+import { camera, cameraSupported } from './camera';
+import { WakeWord } from './wakeword';
 
 const canvas =
   document.querySelector<HTMLCanvasElement>('#hud-canvas') ||
@@ -24,6 +26,8 @@ if (canvas) {
  * against localhost that never touches the paid path, so it cannot spend anything.
  */
 let budgetText = '';
+let wakeText = '';
+let lastFrameText = '';
 
 async function refreshBudget() {
   const u = await metaClient.getUsage();
@@ -45,6 +49,9 @@ function render() {
 
   const state = hudStore.getState();
 
+  // live camera behind the reticles when one is running
+  if (camera.isLive) camera.drawBackground(ctx, HUD_SIZE, HUD_SIZE);
+
   // Status banner. The HTML header occupies canvas-space y 12-31, so this sits below it.
   ctx.font = '10px monospace';
   ctx.fillStyle = state.status === 'ALERT' ? '#BD00FF' : '#00F0FF';
@@ -54,6 +61,13 @@ function render() {
   const mock = shouldUseMock();
   ctx.fillStyle = mock ? '#FCEE0A' : '#00F0FF';
   ctx.fillText(`SAM 3.1: ${mock ? `MOCK (${mockReason() ?? 'default'})` : 'LIVE'}`, 20, 62);
+
+  // frame source + wake-word state
+  if (lastFrameText || wakeText) {
+    ctx.font = '10px monospace';
+    ctx.fillStyle = '#00F0FF';
+    ctx.fillText(`${lastFrameText}${wakeText ? '  ' + wakeText : ''}`, 20, 90);
+  }
 
   // Spend readout, only when a proxy is actually reporting a ledger
   if (budgetText) {
@@ -126,7 +140,15 @@ async function triggerSnapshot() {
   hudStore.setStatus('PROCESSING');
 
   try {
-    const result = await metaClient.analyzeFrame();
+    const frame = camera.capture();
+    lastFrameText = `FRAME: ${frame.source} ${frame.width}x${frame.height}`;
+    if (frame.reason) console.log(`[HUD] frame fallback: ${frame.reason}`);
+    console.log(`[HUD] snapshot frame: ${frame.source} ${frame.width}x${frame.height}`);
+
+    const result = await metaClient.analyzeFrame(frame.dataUrl, {
+      width: frame.width,
+      height: frame.height,
+    });
     const breach = result.containers.some((c) => c.status === 'breach');
     const warn = result.containers.some((c) => c.status === 'warning');
 
@@ -210,6 +232,65 @@ async function triggerMic() {
 
 (window as any).triggerMic = triggerMic;
 
+/**
+ * Hands-free wake word. Shares the in-flight guards with S and V so a wake event can never
+ * stack a capture on top of one already running. Paused during our own capture so the tail
+ * of the recording does not retrigger it.
+ */
+const wake = new WakeWord({
+  phrases: ['hey line check', 'line check'],
+  cooldownMs: 4000,
+  preferred: env.wakeMode,
+  canFire: () => !snapshotInFlight && !voiceInFlight && !wakeBusy,
+  onWake: ({ phrase, mode, confidence }) => {
+    console.log(`[HUD] wake (${mode}): "${phrase}"${confidence !== undefined ? ' conf ' + confidence.toFixed(2) : ''}`);
+    void runWakeChain();
+  },
+});
+
+let wakeBusy = false;
+
+async function runWakeChain() {
+  if (wakeBusy || voiceInFlight) return;
+  wakeBusy = true;
+  wake.pause();
+  try {
+    await triggerVoice();
+  } finally {
+    wakeBusy = false;
+    wake.resume();
+  }
+}
+
+async function toggleWake() {
+  if (wake.activeMode !== 'unavailable') {
+    wake.stop();
+    wakeText = 'WAKE: off';
+    console.log('[HUD] wake word stopped');
+    return;
+  }
+  const mode = await wake.start(env.wakeMode);
+  wakeText = mode === 'unavailable' ? 'WAKE: unavailable' : `WAKE: ${mode}`;
+  console.log(`[HUD] wake word ${mode}${wake.statusReason ? ' - ' + wake.statusReason : ''}`);
+}
+
+(window as any).toggleWake = toggleWake;
+(window as any).wakeWord = wake;
+
+/** Start the webcam on load; failure is silent and S falls back to a synthetic frame. */
+async function initCamera() {
+  if (!cameraSupported()) {
+    lastFrameText = 'FRAME: synthetic (no camera API)';
+    return;
+  }
+  const ok = await camera.start();
+  lastFrameText = ok ? 'FRAME: camera live' : `FRAME: synthetic (${camera.reason ?? 'no camera'})`;
+  console.log(`[HUD] camera: ${ok ? 'live' : 'unavailable'}${camera.reason ? ' - ' + camera.reason : ''}`);
+}
+void initCamera();
+
+(window as any).startCamera = initCamera;
+
 // Keyboard Test Harness
 window.addEventListener('keydown', async (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -226,6 +307,15 @@ window.addEventListener('keydown', async (e) => {
     case 'm':
     case 'M':
       await triggerMic();
+      break;
+    case 'w':
+    case 'W':
+      await toggleWake();
+      break;
+    case 'c':
+    case 'C':
+      camera.stop();
+      await initCamera();
       break;
     case '1':
       console.log('[HUD] tare_scale');

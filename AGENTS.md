@@ -23,8 +23,15 @@
    `SAM 3.1: MOCK (<reason>)` so a mock run cannot be mistaken for a live one.
 4. **Everything is normalised into 600x600 before the UI sees it.** `normalizeToHud()` owns that
    conversion; do not feed raw model coordinates to `hudStore`.
-5. **Never commit secrets or local state.** `.env*`, `.remember/`, `node_modules/`, `dist/` and
-   `.testdist/` are ignored. Session transcripts stay out of the repo.
+5. **Never commit secrets or local state.** `.env*`, `.remember/`, `node_modules/`, `dist/`,
+   `.testdist/` and `.cache/` are ignored. Session transcripts and the spend ledger stay out of
+   the repo.
+6. **Budget ceilings are enforced before the network call.** The proxy reserves cost, checks
+   `MAX_PAID_CALLS` / `MAX_SPEND_USD` / `MAX_SESSION_SPEND_USD`, and only then calls upstream.
+   Never move a budget check after the fetch.
+7. **Sensory input degrades, it does not fail.** Camera and microphone both fall back (synthetic
+   frame, synthetic audio) so `S`, `V` and the wake word work with no hardware and in headless
+   runs.
 
 ## Verification expectations
 
@@ -37,9 +44,11 @@ npm test              # 13 coordinate-contract assertions
 npm run build         # production bundle
 ```
 
-Then exercise it in a browser. A green build is not evidence the HUD renders correctly: three
-runtime defects in this repo (banner drawn under the header, label plate narrower than its text,
-tools stranded in `PROCESSING`) all compiled cleanly.
+Then exercise it in a browser. A green build is not evidence the HUD renders correctly: several
+runtime defects in this repo compiled cleanly and were only found by running it - a banner drawn
+under the header, a label plate narrower than its text, tools stranded in `PROCESSING`, a wake
+word reporting itself active while erroring, and a replay cache that never hit because it hashed
+a random multipart boundary.
 
 ## Layout
 

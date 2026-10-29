@@ -57,7 +57,10 @@ export class MetaModelClient {
    * It is deliberately not safe to call per animation frame: an in-flight guard and a
    * minimum interval both refuse rapid calls, so a stray rAF loop cannot burn credits.
    */
-  async analyzeFrame(imageDataBase64?: string): Promise<VisionResponse> {
+  async analyzeFrame(
+    imageDataBase64?: string,
+    frame?: { width: number; height: number },
+  ): Promise<VisionResponse> {
     if (shouldUseMock()) {
       return {
         source: 'local_mock_cache',
@@ -77,6 +80,8 @@ export class MetaModelClient {
 
     this.inFlight = true;
     this.lastCallAt = now;
+    // a real captured frame carries its own dimensions; fall back to the configured frame
+    const sourceFrame = frame ?? this.frame;
     try {
       const response = await fetch(env.samEndpoint, {
         method: 'POST',
@@ -85,7 +90,7 @@ export class MetaModelClient {
           // proxy mode: the proxy injects the credential, so none is sent from the browser
           ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
         },
-        body: JSON.stringify({ frame: imageDataBase64, width: this.frame.width, height: this.frame.height }),
+        body: JSON.stringify({ frame: imageDataBase64, width: sourceFrame.width, height: sourceFrame.height }),
       });
 
       if (!response.ok) {
@@ -93,7 +98,7 @@ export class MetaModelClient {
       }
 
       const data = (await response.json()) as { detections?: RawDetection[] };
-      const containers = normalizeToHud(data.detections ?? [], this.frame);
+      const containers = normalizeToHud(data.detections ?? [], sourceFrame);
       this.lastResponse = { source: 'live_meta_api', containers };
       return this.lastResponse;
     } finally {

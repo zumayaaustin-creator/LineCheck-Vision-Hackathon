@@ -90,6 +90,8 @@ Out of the box it runs **entirely on local mocks** - no key, no credits, no netw
 |---|---|
 | `S` | one SAM 3.1 snapshot |
 | `M` | hold a 2.2s microphone capture, then send to Muse |
+| `W` | toggle the hands-free wake word |
+| `C` | restart the camera capture |
 | `V` | one Muse utterance using synthetic audio |
 | `1` `2` `3` `4` | tare_scale · calculate_yield · verify_pan_depth · record_waste |
 | `0` | clear the HUD |
@@ -114,8 +116,11 @@ exercised for free. `harness/proxy-server.mjs` keeps the credential server-side.
 | Local mock contracts (SAM 3.1 + Muse) | **working** |
 | Server-side key proxy with cost ceiling | **working** |
 | Microphone capture | **working, with graceful fallback** |
+| USD spend ledger + reconciliation | **working** - persistent, self-calibrating from upstream usage |
+| Content-addressed replay cache | **working** - pay once per unique frame/command |
+| Real camera capture | **working** - 1280x720 with synthetic fallback |
+| Wake word ("line check") | **working** - speech recognition, VAD fallback, $0.00 |
 | Live Meta SAM 3.1 / Muse calls | **not yet** - contract shapes settled, real endpoints not wired |
-| Wake-word detection | **not yet** - push-to-talk only |
 
 The live branch has only ever spoken to the local mock. It has never contacted Meta, and no real
 API key exists in this repository.

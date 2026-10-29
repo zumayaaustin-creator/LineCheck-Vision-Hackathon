@@ -24,9 +24,19 @@ rejected with `429` + a reason if it would breach. Verified: with `MAX_SPEND_USD
 taking spend from $0.18 to $0.23 returned `429 budget_exceeded` and the proxy log shows no
 upstream line after the refusal.
 
-**Remaining caveat:** those per-call costs are **estimates**, not Meta's published pricing.
-Replace them with real figures before trusting the $120 figure; the mechanism is right, the
-constants are guesses.
+**Self-calibration, added:** the estimates no longer have to be guesses. After every 2xx the
+proxy reads the upstream `usage` block (`total_cost_usd`, `prompt_tokens`, `completion_tokens`,
+`duration_seconds`) plus billing headers, writes the **first raw sample per route** to
+`.cache/live-usage-sample.json`, and reconciles the reserved floor against the real figure.
+
+Verified on all three branches:
+- explicit `total_cost_usd` -> reserved $0.05 reconciled to $0.012904, ledger follows
+- tokens only, `PRICE_*_USD_PER_1K` set -> reserved $0.05 reconciled to exactly **$0.00864**
+  (1180/1000*0.003 + 340/1000*0.015, matching the arithmetic)
+- no usage block -> `NO-RECONCILE ... keeping the floor`, ledger stays at the $0.05 reserve
+
+**Still outstanding:** the price constants ship at **0**, so token-only responses do not
+reconcile until real pricing is configured. Explicit `total_cost_usd` needs no constants.
 
 ## Immediate Deliverables
 
@@ -72,6 +82,16 @@ A repeated identical command costs $0.00 on both hops.
 ## Next
 
 - [ ] Wire the real Meta endpoints behind the proxy (`META_SAM_URL`, `META_MUSE_URL`, `META_MUSE_SPARK_URL`)
-- [ ] Replace the call ceiling with a USD-accurate budget stop at $120
-- [ ] Wake-word detection to replace push-to-talk
-- [ ] Real camera frame capture for the snapshot path
+- [x] Replace the call ceiling with a USD-accurate budget stop at $120
+      Done: lifetime and per-session USD ceilings with a persistent ledger and post-response
+      reconciliation. The $120 figure becomes accurate as soon as `total_cost_usd` comes back
+      from real calls, or the `PRICE_*` constants are set.
+- [x] Wake-word detection to replace push-to-talk
+      `src/wakeword.ts`: SpeechRecognition phrase match ("line check" / "hey line check") with an
+      on-device energy-VAD fallback, `VITE_WAKE_MODE=auto|speech|vad`. Shares the in-flight
+      guards and pauses during its own capture. Phrase matching covered by 10 CI tests
+      (case, punctuation, custom lists, substring safety, null input).
+- [x] Real camera frame capture for the snapshot path
+      `src/camera.ts`: webcam at 1280x720, true dimensions passed into `analyzeFrame()` so
+      normalisation uses the real source frame. Deterministic synthetic fallback when there is
+      no camera or no permission. HUD shows `FRAME: camera live` or `FRAME: synthetic 1280x720`.

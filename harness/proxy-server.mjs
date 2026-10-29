@@ -77,6 +77,16 @@ const MAX_PAID_CALLS        = Number(process.env.MAX_PAID_CALLS ?? 60);
 const MAX_SPEND_USD         = Number(process.env.MAX_SPEND_USD ?? 120.0);
 const MAX_SESSION_SPEND_USD = Number(process.env.MAX_SESSION_SPEND_USD ?? 5.0);
 
+// Fallback pricing used ONLY when upstream reports tokens/duration but no explicit cost.
+// Leave at 0 to disable token-based reconciliation and keep the conservative floor.
+const TOKEN_PRICE = {
+  promptPer1k: Number(process.env.PRICE_PROMPT_USD_PER_1K ?? 0),
+  completionPer1k: Number(process.env.PRICE_COMPLETION_USD_PER_1K ?? 0),
+  audioPerSecond: Number(process.env.PRICE_AUDIO_USD_PER_SECOND ?? 0),
+};
+
+const USAGE_SAMPLE_PATH = process.env.PROXY_USAGE_SAMPLE_PATH || '.cache/live-usage-sample.json';
+
 const CACHE_MODE = process.env.PROXY_CACHE_MODE || 'record-or-replay';
 const CACHE_DIR  = process.env.PROXY_CACHE_DIR || '.cache/replay';
 const LEDGER_PATH = process.env.PROXY_LEDGER_PATH || '.cache/spend-ledger.json';
@@ -98,6 +108,8 @@ const emptyLedger = () => ({
   cacheHits: 0,
   failedCalls: 0,
   refundedUsd: 0,
+  reconciledUsd: 0,
+  reconciledCalls: 0,
   byRoute: {
     sam:   { calls: 0, spendUsd: 0 },
     muse:  { calls: 0, spendUsd: 0 },
@@ -244,6 +256,104 @@ function readBody(req) {
 
 const log = (m) => console.log(`[proxy] ${new Date().toISOString().slice(11, 23)}  ${m}`);
 
+// ---------------------------------------------------------------- usage reconciliation
+const BILLING_HEADER_RE = /^(x-)?(ratelimit|rate-limit|cost|billing|usage|request-id|x-request-id|retry-after)/i;
+
+/** pull billing-ish headers, never the credential */
+function billingHeaders(headers) {
+  const out = {};
+  for (const [k, v] of headers.entries()) {
+    if (/^(authorization|set-cookie|cookie)$/i.test(k)) continue;
+    if (BILLING_HEADER_RE.test(k) || /^x-.*(cost|usage|billing)/i.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+/** find a usage object anywhere sane in the upstream JSON */
+function extractUsage(body) {
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+  const candidates = [parsed?.usage, parsed?.meta?.usage, parsed?.billing, parsed?.data?.usage];
+  const usage = candidates.find((u) => u && typeof u === 'object');
+  if (!usage) return null;
+  return {
+    total_cost_usd: num(usage.total_cost_usd ?? usage.cost_usd ?? usage.cost),
+    prompt_tokens: num(usage.prompt_tokens ?? usage.input_tokens),
+    completion_tokens: num(usage.completion_tokens ?? usage.output_tokens),
+    duration_seconds: num(usage.duration_seconds ?? usage.billed_seconds ?? usage.audio_seconds),
+    raw: usage,
+  };
+}
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Turn whatever the upstream reported into an actual USD figure.
+ * Explicit cost wins. Tokens/seconds only reconcile when a price constant is configured -
+ * otherwise we would be inventing a number, which is worse than keeping the floor.
+ */
+function actualCostFrom(usage) {
+  if (!usage) return { usd: null, basis: 'no usage block' };
+  if (usage.total_cost_usd !== undefined) {
+    return { usd: usage.total_cost_usd, basis: 'upstream total_cost_usd' };
+  }
+  const parts = [];
+  let usd = 0;
+  if (usage.prompt_tokens !== undefined && TOKEN_PRICE.promptPer1k > 0) {
+    usd += (usage.prompt_tokens / 1000) * TOKEN_PRICE.promptPer1k;
+    parts.push('prompt tokens');
+  }
+  if (usage.completion_tokens !== undefined && TOKEN_PRICE.completionPer1k > 0) {
+    usd += (usage.completion_tokens / 1000) * TOKEN_PRICE.completionPer1k;
+    parts.push('completion tokens');
+  }
+  if (usage.duration_seconds !== undefined && TOKEN_PRICE.audioPerSecond > 0) {
+    usd += usage.duration_seconds * TOKEN_PRICE.audioPerSecond;
+    parts.push('audio seconds');
+  }
+  if (parts.length === 0) {
+    return { usd: null, basis: 'tokens/seconds present but no price constant configured' };
+  }
+  return { usd: round6(usd), basis: `computed from ${parts.join(' + ')}` };
+}
+
+/** record the first raw usage sample per route, verbatim, for calibrating the constants */
+async function recordUsageSample(routePath, status, body, headers, reconciliation) {
+  let store = { version: 1, note: 'First raw upstream usage block + billing headers per route. Use these to replace the COST_PER_* estimates with real pricing.', samples: {} };
+  try {
+    store = JSON.parse(await fs.readFile(USAGE_SAMPLE_PATH, 'utf8'));
+  } catch { /* first run */ }
+
+  store.samples = store.samples || {};
+  if (store.samples[routePath]) return false; // first sample per route only
+
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch { /* keep raw text */ }
+
+  store.samples[routePath] = {
+    capturedAtUtc: new Date().toISOString(),
+    status,
+    headers: headers,
+    usage: parsed?.usage ?? parsed?.meta?.usage ?? null,
+    reconciliation,
+    bodyPreview: parsed ? undefined : body.slice(0, 600),
+  };
+
+  try {
+    mkdirSync(path.dirname(USAGE_SAMPLE_PATH), { recursive: true });
+    const tmp = `${USAGE_SAMPLE_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(store, null, 2));
+    renameSync(tmp, USAGE_SAMPLE_PATH);
+    return true;
+  } catch (err) {
+    console.error(`[proxy] WARN: usage sample write failed (${err.message})`);
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------- boot guards
 if (!API_KEY) {
   console.error('[proxy] FATAL: META_API_KEY is not set. The key belongs here, never in VITE_*.');
@@ -284,6 +394,12 @@ const server = createServer(async (req, res) => {
         costPerRoute: COST,
       },
       cache: { mode: CACHE_MODE, dir: CACHE_DIR, hits: ledger.cacheHits },
+      reconciliation: {
+        reconciledCalls: ledger.reconciledCalls,
+        reconciledDeltaUsd: round6(ledger.reconciledUsd),
+        usageSamplePath: USAGE_SAMPLE_PATH,
+        tokenPricing: TOKEN_PRICE,
+      },
       keyConfigured: true,
     });
     return;
@@ -297,6 +413,8 @@ const server = createServer(async (req, res) => {
       cacheHits: ledger.cacheHits,
       failedCalls: ledger.failedCalls,
       refundedUsd: round6(ledger.refundedUsd),
+      reconciledUsd: round6(ledger.reconciledUsd),
+      reconciledCalls: ledger.reconciledCalls,
       sessionSpendUsd: round6(sessionSpendUsd),
       sessionRemainingUsd: round6(Math.max(0, MAX_SESSION_SPEND_USD - sessionSpendUsd)),
       maxPaidCalls: MAX_PAID_CALLS,
@@ -420,6 +538,40 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // ---- reconcile the reserved floor against what the upstream actually reported ----
+    const usage = extractUsage(text);
+    const actual = actualCostFrom(usage);
+    let reconciliation = {
+      reservedUsd: nextCost,
+      actualUsd: null,
+      deltaUsd: 0,
+      basis: actual.basis,
+    };
+
+    if (actual.usd !== null) {
+      const delta = round6(actual.usd - nextCost);
+      ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd + delta));
+      sessionSpendUsd = round6(Math.max(0, sessionSpendUsd + delta));
+      ledger.byRoute[route.key].spendUsd = round6(Math.max(0, ledger.byRoute[route.key].spendUsd + delta));
+      ledger.reconciledUsd = round6(ledger.reconciledUsd + delta);
+      ledger.reconciledCalls += 1;
+      reconciliation = { reservedUsd: nextCost, actualUsd: actual.usd, deltaUsd: delta, basis: actual.basis };
+      saveLedger();
+
+      const sign = delta >= 0 ? '+' : '-';
+      log(`RECONCILE ${url.pathname} reserved $${nextCost.toFixed(4)} -> actual $${actual.usd.toFixed(6)} (${sign}$${Math.abs(delta).toFixed(6)}) [${actual.basis}] lifetime $${ledger.totalSpendUsd.toFixed(4)}`);
+      if (ledger.totalSpendUsd > MAX_SPEND_USD) {
+        log(`WARN: reconciliation pushed lifetime spend to $${ledger.totalSpendUsd.toFixed(4)}, above the $${MAX_SPEND_USD} ceiling - it was already spent`);
+      }
+    } else {
+      log(`NO-RECONCILE ${url.pathname}: ${actual.basis} - keeping the $${nextCost.toFixed(2)} floor`);
+    }
+
+    const sampleWritten = await recordUsageSample(
+      url.pathname, upstream.status, text, billingHeaders(upstream.headers), reconciliation,
+    );
+    if (sampleWritten) log(`SAMPLE ${url.pathname} -> ${USAGE_SAMPLE_PATH}`);
+
     // only successful responses are worth replaying
     await writeCache(hash, {
       hash,
@@ -436,6 +588,7 @@ const server = createServer(async (req, res) => {
       'Content-Type': upstream.headers.get('content-type') || 'application/json',
       'Content-Length': Buffer.byteLength(text),
       'X-Proxy-Cost': nextCost.toFixed(3),
+      'X-Proxy-Cost-Actual': reconciliation.actualUsd === null ? 'unknown' : String(reconciliation.actualUsd),
       'X-Proxy-Cache': cached ? 'miss-recorded' : 'miss',
       ...corsFor(req),
     });

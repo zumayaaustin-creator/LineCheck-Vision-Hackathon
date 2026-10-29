@@ -228,6 +228,33 @@ refundedUsd, sessionSpendUsd, byRoute, ...}`. The HUD shows `remainingUsd` on it
 > These per-call costs are **estimates**, not Meta's published prices. Replace them before
 > trusting the $120 figure - the mechanism is right, the constants are guesses.
 
+### Usage reconciliation - self-calibrating costs
+
+The `COST_PER_*` values above are **estimates**. After every 2xx response the proxy reads the
+upstream body and reconciles the reservation against reality:
+
+1. **Pre-call reservation** still uses the conservative floor, so ceilings block before firing.
+2. **Post-response** it looks for `usage` (`total_cost_usd`, `prompt_tokens`,
+   `completion_tokens`, `duration_seconds`, `billed_seconds`) in the JSON, and captures
+   billing-ish headers (`x-ratelimit-*`, `x-request-id`, cost/usage headers).
+3. The **first** raw usage block + headers per route is written verbatim to
+   `.cache/live-usage-sample.json` (gitignored) - exact telemetry from call #1, so the constants
+   can be replaced with real numbers rather than guesses.
+4. If an explicit cost exists, the ledger is adjusted by the delta. If only tokens/seconds are
+   reported, they are converted **only when a price constant is configured**:
+
+```
+PRICE_PROMPT_USD_PER_1K=0
+PRICE_COMPLETION_USD_PER_1K=0
+PRICE_AUDIO_USD_PER_SECOND=0
+```
+
+All zero by default - inventing a price is worse than keeping the conservative floor. When
+nothing usable is reported the proxy logs `NO-RECONCILE ... keeping the floor`.
+
+Response headers: `X-Proxy-Cost` (reserved) and `X-Proxy-Cost-Actual` (reconciled, or `unknown`).
+`/__usage` adds `reconciledCalls` and `reconciledUsd`.
+
 ### Replay cache - pay once per unique request
 
 `PROXY_CACHE_MODE=record-or-replay` (default; also `record-only`, `off`).
@@ -267,6 +294,26 @@ Muse -> WebMCP tool call.
 
 ---
 
+## Camera and wake word
+
+`src/camera.ts` captures a real webcam frame at 1280x720 and passes its **true** dimensions into
+the SAM snapshot, so `normalizeToHud()` scales from what the camera produced rather than an
+assumed constant. No camera, no permission, or no API all fall back to a deterministic synthetic
+frame - a snapshot is always possible, only the source changes. The HUD shows
+`FRAME: camera live` or `FRAME: synthetic 1280x720 (reason)`.
+
+`src/wakeword.ts` adds a hands-free trigger, $0.00 against the Meta budget, in two backends:
+
+| mode | what | honesty note |
+|---|---|---|
+| `speech` | `SpeechRecognition` phrase match on "line check" / "hey line check" | most Chromium builds back this with a remote service; it costs no Meta credit but is not guaranteed on-device. On-device processing is requested where the build supports it. |
+| `vad` | RMS energy gate over an `AnalyserNode` | genuinely on-device, but it detects that someone spoke, not which words |
+
+`VITE_WAKE_MODE=auto` prefers on-device speech, then VAD. If both fail the HUD reports
+`WAKE: unavailable` with a reason and everything else keeps working. The wake trigger shares the
+in-flight guards with `S` and `V`, and is paused during its own capture so the tail of the
+recording cannot retrigger it.
+
 ## Keyboard harness (in the HUD)
 
 | key | action |
@@ -278,6 +325,8 @@ Muse -> WebMCP tool call.
 | `2` | `calculate_yield` |
 | `3` | `verify_pan_depth` (15% -> warning) |
 | `4` | `record_waste` (-> ALERT) |
+| `C` | restart the camera capture |
+| `W` | toggle the wake word listener |
 | `0` | clear |
 
 Both `S` and `V` are guarded by an in-flight flag plus a debounce, and the client adds its own
