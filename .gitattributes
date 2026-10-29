@@ -1,0 +1,17 @@
+# Normalise line endings so the repo is identical on any machine and on GitHub.
+* text=auto eol=lf
+
+# Windows-native scripts keep CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be touched
+*.png binary
+*.jpg binary
+*.ico binary
+*.mp4 binary
+*.woff2 binary
+
+# Lockfiles: do not diff into review noise
+package-lock.json -diff
