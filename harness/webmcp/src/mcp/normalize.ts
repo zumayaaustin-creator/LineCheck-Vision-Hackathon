@@ -1,5 +1,5 @@
 import type { ContainerTarget, ReticleStatus } from '../types/hud';
-import { HUD_SIZE } from '../config/env';
+import { HUD_SIZE } from '../config/constants';
 
 /**
  * A detection as it comes off the wire. SAM 3.1 returns pixel boxes in the *source frame*

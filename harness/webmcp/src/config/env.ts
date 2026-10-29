@@ -7,10 +7,11 @@
  * to the paid path.
  */
 
-const raw = import.meta.env;
+import { HUD_SIZE } from './constants';
 
-/** HUD canvas is fixed 600x600; all detection geometry is normalised into this space. */
-export const HUD_SIZE = 600;
+export { HUD_SIZE };
+
+const raw = import.meta.env;
 
 function isExplicitlyOff(v: string | undefined): boolean {
   return v === 'false' || v === '0';

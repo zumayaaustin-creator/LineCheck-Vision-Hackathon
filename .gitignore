@@ -29,6 +29,7 @@ dist-ssr/
 .vite/
 .cache/
 coverage/
+.testdist/
 
 # ---- local agent state (contains session transcripts, not product code) ----
 .remember/
