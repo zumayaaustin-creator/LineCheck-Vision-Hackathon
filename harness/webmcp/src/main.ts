@@ -45,15 +45,25 @@ function render() {
     ctx.lineWidth = 2;
     ctx.strokeRect(r.x, r.y, r.width, r.height);
 
-    // Size the label plate to the text, not the reticle, or long labels spill out of it
+    // Size the label plate to the text, not the reticle, or long labels spill out of it.
+    // A box flush against the right edge (x + width === 600) would otherwise push its
+    // plate past the canvas and get visually clipped, so clamp the plate into bounds and
+    // clip the text to the plate.
     ctx.font = 'bold 11px monospace';
-    const labelW = Math.max(r.width, Math.ceil(ctx.measureText(r.label).width) + 12);
-    ctx.fillStyle = 'rgba(5, 5, 5, 0.9)';
-    ctx.fillRect(r.x, r.y - 18, labelW, 18);
-    ctx.strokeRect(r.x, r.y - 18, labelW, 18);
+    const labelW = Math.min(HUD_SIZE, Math.max(r.width, Math.ceil(ctx.measureText(r.label).width) + 12));
+    const labelX = Math.max(0, Math.min(r.x, HUD_SIZE - labelW));
 
+    ctx.fillStyle = 'rgba(5, 5, 5, 0.9)';
+    ctx.fillRect(labelX, r.y - 18, labelW, 18);
+    ctx.strokeRect(labelX, r.y - 18, labelW, 18);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(labelX, r.y - 18, labelW, 18);
+    ctx.clip();
     ctx.fillStyle = stroke;
-    ctx.fillText(r.label, r.x + 6, r.y - 5);
+    ctx.fillText(r.label, labelX + 6, r.y - 5);
+    ctx.restore();
   });
 
   requestAnimationFrame(render);
@@ -108,6 +118,41 @@ async function triggerSnapshot() {
 
 (window as any).triggerSnapshot = triggerSnapshot;
 
+/**
+ * Voice: one explicit wake event -> Muse transcript -> WebMCP tool execution.
+ * Snapshot-only for the same reason as SAM: never a continuous microphone loop.
+ */
+let voiceInFlight = false;
+
+async function triggerVoice(hint?: string) {
+  if (voiceInFlight) {
+    console.log('[HUD] voice ignored: call already in flight');
+    return;
+  }
+  voiceInFlight = true;
+  hudStore.setStatus('LISTENING');
+  try {
+    const audio = new Blob([new Uint8Array(2048)], { type: 'audio/wav' });
+    const result = await metaClient.processKitchenQuery(audio, hint);
+    console.log(`[HUD] voice (${result.source}): "${result.transcription}"`);
+
+    if (result.toolCall) {
+      console.log(`[HUD] voice -> tool ${result.toolCall.name}`, result.toolCall.arguments);
+      await executeTool(result.toolCall.name, result.toolCall.arguments);
+    } else {
+      console.log('[HUD] voice returned no tool call');
+      hudStore.setStatus('IDLE');
+    }
+  } catch (err) {
+    console.error('[HUD] voice failed:', err);
+    hudStore.setStatus('IDLE');
+  } finally {
+    voiceInFlight = false;
+  }
+}
+
+(window as any).triggerVoice = triggerVoice;
+
 // Keyboard Test Harness
 window.addEventListener('keydown', async (e) => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -116,6 +161,10 @@ window.addEventListener('keydown', async (e) => {
     case 's':
     case 'S':
       await triggerSnapshot();
+      break;
+    case 'v':
+    case 'V':
+      await triggerVoice();
       break;
     case '1':
       console.log('[HUD] tare_scale');

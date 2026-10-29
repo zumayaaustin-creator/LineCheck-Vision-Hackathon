@@ -12,11 +12,18 @@ export interface VisionResponse {
   throttled?: boolean;
 }
 
+export interface ToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
 export interface VoiceCommandResponse {
   transcription: string;
   assistantReply: string;
   actionRequired?: string;
   source: 'live_meta_api' | 'local_mock_cache';
+  /** the WebMCP tool a Muse utterance resolves to, ready for executeTool() */
+  toolCall?: ToolCall;
 }
 
 /** Shape of the mock fixture: already in HUD space, so it is passed through unnormalised. */
@@ -88,13 +95,14 @@ export class MetaModelClient {
    * Muse Voice -> Muse Spark reasoning. Also gated: one shot per explicit wake event,
    * never opened on a continuous microphone loop.
    */
-  async processKitchenQuery(audioBlob?: Blob): Promise<VoiceCommandResponse> {
+  async processKitchenQuery(audioBlob?: Blob, hint?: string): Promise<VoiceCommandResponse> {
     if (shouldUseMock()) {
       return {
         source: 'local_mock_cache',
         transcription: 'Check prep level on diced shallots',
         assistantReply: 'Shallots at 25% in station 2. Re-up needed before dinner service.',
         actionRequired: 'NOTIFY_PREP',
+        toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 25 } },
       };
     }
 
@@ -107,6 +115,8 @@ export class MetaModelClient {
 
     const body = new FormData();
     body.append('audio', audioBlob, 'wake.wav');
+    // optional scenario hint so the mock server can return a specific utterance
+    if (hint) body.append('hint', hint);
 
     const response = await fetch(env.museEndpoint, {
       method: 'POST',
@@ -115,12 +125,21 @@ export class MetaModelClient {
     });
     if (!response.ok) throw new Error(`Muse HTTP ${response.status}`);
 
-    const data = (await response.json()) as { transcription?: string; reply?: string; action?: string };
+    const data = (await response.json()) as {
+      transcription?: string;
+      reply?: string;
+      action?: string;
+      tool?: { name?: string; arguments?: Record<string, unknown> };
+    };
     return {
       source: 'live_meta_api',
       transcription: data.transcription ?? '',
       assistantReply: data.reply ?? '',
       actionRequired: data.action,
+      toolCall:
+        data.tool?.name !== undefined
+          ? { name: data.tool.name, arguments: data.tool.arguments ?? {} }
+          : undefined,
     };
   }
 }
