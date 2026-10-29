@@ -18,6 +18,7 @@
  * Routes
  *   POST /sam-3.1/segment       -> 1280x720 unnormalised detections
  *   POST /muse-audio/transcribe -> kitchen transcript + WebMCP tool call
+ *   POST /muse-spark/dispatch   -> transcript -> tool selection (Spark 1.3 stand-in)
  *   GET  /health                -> readiness
  *   POST /__simulate?mode=...   -> set a default failure/latency mode for later requests
  *
@@ -35,6 +36,7 @@
 import { createServer } from 'node:http';
 import { buildDetections, SOURCE_FRAME } from './sam-3.1/detections.mjs';
 import { nextTranscript, allScenarios } from './muse-audio/transcripts.mjs';
+import { dispatch } from './muse-audio/spark-dispatch.mjs';
 
 const PORT = Number(process.env.MOCK_PORT || 8787);
 const HOST = process.env.MOCK_HOST || '127.0.0.1';
@@ -90,7 +92,7 @@ const server = createServer(async (req, res) => {
     json(res, 200, {
       status: 'ok',
       service: 'linecheck-mock-contracts',
-      routes: ['/sam-3.1/segment', '/muse-audio/transcribe'],
+      routes: ['/sam-3.1/segment', '/muse-audio/transcribe', '/muse-spark/dispatch'],
       defaultSimulate,
       scenarios: allScenarios(),
       sourceFrame: SOURCE_FRAME,
@@ -107,7 +109,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method !== 'POST' || !['/sam-3.1/segment', '/muse-audio/transcribe'].includes(path)) {
+  if (req.method !== 'POST' || !['/sam-3.1/segment', '/muse-audio/transcribe', '/muse-spark/dispatch'].includes(path)) {
     json(res, 404, { error: 'not_found', path });
     return;
   }
@@ -172,6 +174,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (path === '/muse-spark/dispatch') {
+      const transcript = String(body.transcript ?? '');
+      const tools = Array.isArray(body.tools) ? body.tools : [];
+      const out = dispatch(transcript, tools);
+      log(`#${n} muse-spark -> "${transcript.slice(0, 48)}" => ${out.tool.name} (conf ${out.confidence}) auth ok`);
+      json(res, 200, {
+        ...out,
+        meta: { model: 'muse-spark-1.3-mock', toolsOffered: tools.length },
+      });
+      return;
+    }
+
     // /muse-audio/transcribe
     const scenario = url.searchParams.get('scenario') || body.hint || null;
     const t = nextTranscript(scenario);
@@ -194,7 +208,7 @@ server.listen(PORT, HOST, () => {
   console.log('  LineCheck mock contract server');
   console.log(`  http://${HOST}:${PORT}`);
   console.log(`  token: ${TOKEN}`);
-  console.log('  routes: /sam-3.1/segment  /muse-audio/transcribe  /health  /__simulate');
+  console.log('  routes: /sam-3.1/segment  /muse-audio/transcribe  /muse-spark/dispatch  /health  /__simulate');
   console.log('  simulate: latency | slow | 401 | 500');
   console.log('');
 });

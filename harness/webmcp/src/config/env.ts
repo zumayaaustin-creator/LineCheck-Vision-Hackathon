@@ -29,6 +29,9 @@ export const env = {
   metaApiKey: raw.VITE_META_API_KEY ?? '',
   samEndpoint: raw.VITE_SAM_MODEL_ENDPOINT ?? '',
   museEndpoint: raw.VITE_MUSE_AUDIO_ENDPOINT ?? '',
+  museSparkEndpoint: raw.VITE_MUSE_SPARK_ENDPOINT ?? '',
+  /** optional: GET <url> returns the proxy's /__usage JSON, shown as a budget readout */
+  proxyUsageUrl: raw.VITE_PROXY_USAGE_URL ?? '',
   /** hard floor between paid calls, regardless of how often the UI asks */
   minSnapshotIntervalMs: Number(raw.VITE_SNAPSHOT_MIN_INTERVAL_MS ?? 1500),
   /** source frame geometry the live model returns boxes in */

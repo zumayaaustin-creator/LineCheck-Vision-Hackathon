@@ -116,6 +116,21 @@ Reply:
 
 ---
 
+## Voice chain - three hops, each metered
+
+`Muse Audio -> Muse Spark 1.3 -> WebMCP` runs as three observable steps rather than one opaque
+call:
+
+```
+POST /muse-audio/transcribe   $0.02   "log 2 pounds of salmon trim waste"
+POST /muse-spark/dispatch     $0.03   -> record_waste { Salmon Trim, 907 g }
+executeTool()                 $0.00   -> hudStore + HUD
+```
+
+`harness/muse-audio/spark-dispatch.mjs` is the Spark 1.3 stand-in: it takes a transcript plus the
+offered tools and returns exactly one tool call with arguments already in grams. Keyword-based on
+purpose - it is a stand-in, not a parser.
+
 ## Latency & error injection
 
 Per request:
@@ -173,11 +188,61 @@ VITE_MUSE_AUDIO_ENDPOINT=http://127.0.0.1:8791/muse-audio/transcribe
 `VITE_USE_PROXY=true` tells the client that the missing key is correct rather than a
 misconfiguration - without it `shouldUseMock()` would refuse to leave the mock path.
 
-**Cost guard:** `MAX_PAID_CALLS` (default 60) is a hard ceiling. Past it the proxy returns
-`429 paid_call_cap_reached` and refuses to forward. `GET /__usage` shows
-`{paidCalls, maxPaidCalls, remaining}`.
+### Spend ledger - persistent USD budget
 
-Other knobs: `PROXY_PORT`, `PROXY_TIMEOUT_MS` (30 s), `PROXY_ALLOWED_ORIGINS` (CORS allowlist).
+Three ceilings, all checked **before** the upstream request:
+
+| guard | default | scope |
+|---|---|---|
+| `MAX_PAID_CALLS` | 60 | hard call count |
+| `MAX_SPEND_USD` | 120.00 | lifetime, **survives restarts** |
+| `MAX_SESSION_SPEND_USD` | 5.00 | this process run only |
+
+Per-route estimates (override these with real pricing):
+
+| route | env var | default |
+|---|---|---|
+| `/sam-3.1/segment` | `COST_PER_SAM_CALL_USD` | $0.05 / frame |
+| `/muse-audio/transcribe` | `COST_PER_MUSE_AUDIO_USD` | $0.02 / clip |
+| `/muse-spark/dispatch` | `COST_PER_MUSE_SPARK_USD` | $0.03 / dispatch |
+
+The ledger persists to `.cache/spend-ledger.json` (gitignored) so a restart does not reset spend:
+
+```json
+{ "totalSpendUsd": 0.18, "paidCalls": 4, "cacheHits": 1,
+  "byRoute": { "sam": {"calls": 3, "spendUsd": 0.15}, ... } }
+```
+
+Refusals are `429` with a reason - `call_cap_reached`, `budget_exceeded`, or
+`session_budget_exceeded` - and never reach the network.
+
+**Charge semantics:** the next call's cost is reserved *before* the upstream request so a crash
+still counts it. A non-2xx or unreachable upstream is refunded and logged as `refundedUsd`,
+otherwise one misconfigured URL would burn the whole budget on 401s. Both are recorded, so the
+ledger never quietly under-reports.
+
+`GET /__usage` returns `{paidCalls, totalSpendUsd, remainingUsd, cacheHits, failedCalls,
+refundedUsd, sessionSpendUsd, byRoute, ...}`. The HUD shows `remainingUsd` on its status bar when
+`VITE_PROXY_USAGE_URL` is set.
+
+> These per-call costs are **estimates**, not Meta's published prices. Replace them before
+> trusting the $120 figure - the mechanism is right, the constants are guesses.
+
+### Replay cache - pay once per unique request
+
+`PROXY_CACHE_MODE=record-or-replay` (default; also `record-only`, `off`).
+
+Requests are hashed (`SHA-256` over route + canonicalised body) into `.cache/replay/<hash>.json`.
+A hit is served at **$0.00**, no upstream call is made, `cacheHits` increments, and the response
+carries `X-Proxy-Cache: hit`. A successful live response is written back automatically, so a
+unique frame or voice command is only ever paid for once.
+
+**multipart is canonicalised**: the boundary is randomly generated per request, so hashing raw
+upload bytes makes every audio POST look unique and the cache never hits. Bodies are reduced to
+sorted `field -> content-hash` pairs instead, which is stable across boundaries.
+
+Other knobs: `PROXY_PORT`, `PROXY_TIMEOUT_MS` (30 s), `PROXY_ALLOWED_ORIGINS` (CORS allowlist),
+`PROXY_CACHE_DIR`, `PROXY_LEDGER_PATH`.
 
 ---
 

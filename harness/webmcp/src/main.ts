@@ -1,5 +1,5 @@
 import { hudStore, Reticle } from './hud/state';
-import { executeTool } from './mcp/tools';
+import { executeTool, toolDefinitions } from './mcp/tools';
 import { metaClient } from './mcp/client';
 import { normalizeToHud } from './mcp/normalize';
 import { shouldUseMock, mockReason, HUD_SIZE } from './config/env';
@@ -18,6 +18,21 @@ if (canvas) {
   canvas.width = HUD_SIZE;
   canvas.height = HUD_SIZE;
 }
+
+/**
+ * Spend readout. Polled from the proxy's local /__usage endpoint on a slow timer - a GET
+ * against localhost that never touches the paid path, so it cannot spend anything.
+ */
+let budgetText = '';
+
+async function refreshBudget() {
+  const u = await metaClient.getUsage();
+  budgetText = u
+    ? `BUDGET: $${u.remainingUsd.toFixed(2)} left  (spent $${u.totalSpendUsd.toFixed(2)} / ${u.paidCalls} calls / ${u.cacheHits} cached)`
+    : '';
+}
+void refreshBudget();
+setInterval(() => { void refreshBudget(); }, 10000);
 
 /**
  * Draw loop. This is pure rendering of current state: it must never call the Meta API.
@@ -39,6 +54,14 @@ function render() {
   const mock = shouldUseMock();
   ctx.fillStyle = mock ? '#FCEE0A' : '#00F0FF';
   ctx.fillText(`SAM 3.1: ${mock ? `MOCK (${mockReason() ?? 'default'})` : 'LIVE'}`, 20, 62);
+
+  // Spend readout, only when a proxy is actually reporting a ledger
+  if (budgetText) {
+    const exhausted = budgetText.startsWith('BUDGET: $0.00');
+    ctx.fillStyle = exhausted ? '#BD00FF' : '#FCEE0A';
+    ctx.font = '10px monospace';
+    ctx.fillText(budgetText, 20, 76);
+  }
 
   // Draw Reticles
   state.reticles.forEach((r: Reticle) => {
@@ -153,17 +176,18 @@ async function triggerVoice(hint?: string) {
       audio = new Blob([new Uint8Array(2048)], { type: 'audio/wav' });
     }
 
+    // step 1: transcribe
     const result = await metaClient.processKitchenQuery(audio, hint);
     if (captured) console.log('[HUD] voice used real microphone audio');
-    console.log(`[HUD] voice (${result.source}): "${result.transcription}"`);
+    console.log(`[HUD] 1/3 transcribe (${result.source}): "${result.transcription}"`);
 
-    if (result.toolCall) {
-      console.log(`[HUD] voice -> tool ${result.toolCall.name}`, result.toolCall.arguments);
-      await executeTool(result.toolCall.name, result.toolCall.arguments);
-    } else {
-      console.log('[HUD] voice returned no tool call');
-      hudStore.setStatus('IDLE');
-    }
+    // step 2: Muse Spark 1.3 selects a tool from the transcript
+    const picked = await metaClient.resolveTool(result.transcription, toolDefinitions);
+    console.log(`[HUD] 2/3 spark (${picked.source}, conf ${picked.confidence}): ${picked.toolCall.name}`);
+
+    // step 3: WebMCP execution
+    console.log('[HUD] 3/3 execute', picked.toolCall.name, JSON.stringify(picked.toolCall.arguments));
+    await executeTool(picked.toolCall.name, picked.toolCall.arguments);
   } catch (err) {
     console.error('[HUD] voice failed:', err);
     hudStore.setStatus('IDLE');

@@ -17,6 +17,15 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
+export interface SpendUsage {
+  paidCalls: number;
+  totalSpendUsd: number;
+  remainingUsd: number;
+  cacheHits: number;
+  sessionRemainingUsd?: number;
+  maxSpendUsd?: number;
+}
+
 export interface VoiceCommandResponse {
   transcription: string;
   assistantReply: string;
@@ -142,6 +151,73 @@ export class MetaModelClient {
           ? { name: data.tool.name, arguments: data.tool.arguments ?? {} }
           : undefined,
     };
+  }
+
+  /**
+   * Muse Spark 1.3 hop: given a transcript and the available tools, pick one tool + arguments.
+   * Kept separate from transcription so the chain
+   *   transcribe -> dispatch -> executeTool
+   * is three observable steps rather than one opaque call.
+   */
+  async resolveTool(
+    transcript: string,
+    tools: Array<{ name: string }>,
+  ): Promise<{ toolCall: ToolCall; source: 'live_meta_api' | 'local_mock_cache'; confidence: number }> {
+    // offline fallback: pick by keyword using the same rules the mock uses
+    const localFallback = (): { toolCall: ToolCall; confidence: number } => {
+      const low = transcript.toLowerCase();
+      if (/waste|trim|spoilage|scrap|log/.test(low)) {
+        return { toolCall: { name: 'record_waste', arguments: { ingredient: 'Salmon Trim', weight_g: 907, reason: 'Trim waste' } }, confidence: 0.9 };
+      }
+      if (/yield|edible|as purchased/.test(low)) {
+        return { toolCall: { name: 'calculate_yield', arguments: { ap_weight_g: 6804, ep_weight_g: 4762, trim_weight_g: 2042 } }, confidence: 0.9 };
+      }
+      if (/tare|zero|calibrat/.test(low)) {
+        return { toolCall: { name: 'tare_scale', arguments: { unit: 'g' } }, confidence: 0.9 };
+      }
+      return { toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '4-inch Hotel Pan', fill_percentage: 15 } }, confidence: 0.6 };
+    };
+
+    if (shouldUseMock() || !env.museSparkEndpoint) {
+      const f = localFallback();
+      return { ...f, source: 'local_mock_cache' };
+    }
+
+    const response = await fetch(env.museSparkEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
+      },
+      body: JSON.stringify({ transcript, tools }),
+    });
+    if (!response.ok) throw new Error(`Muse Spark HTTP ${response.status}`);
+
+    const data = (await response.json()) as {
+      tool?: { name?: string; arguments?: Record<string, unknown> };
+      confidence?: number;
+    };
+    if (!data.tool?.name) {
+      const f = localFallback();
+      return { ...f, source: 'local_mock_cache' };
+    }
+    return {
+      toolCall: { name: data.tool.name, arguments: data.tool.arguments ?? {} },
+      source: 'live_meta_api',
+      confidence: data.confidence ?? 0,
+    };
+  }
+
+  /** read the proxy's spend ledger; never a paid call, purely informational */
+  async getUsage(): Promise<SpendUsage | null> {
+    if (!env.proxyUsageUrl) return null;
+    try {
+      const r = await fetch(env.proxyUsageUrl, { method: 'GET' });
+      if (!r.ok) return null;
+      return (await r.json()) as SpendUsage;
+    } catch {
+      return null;
+    }
   }
 }
 
