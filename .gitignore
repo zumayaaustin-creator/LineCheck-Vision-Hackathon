@@ -1,0 +1,63 @@
+# ---- secrets: never commit ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+credentials.json
+secrets.json
+*service-account*.json
+
+# ---- Meta / model API keys ----
+*.api-key
+.meta-credentials
+.muse-credentials
+
+# ---- dependencies ----
+node_modules/
+.pnp/
+.pnp.js
+.yarn/cache
+.yarn/install-state.gz
+
+# ---- build output (regenerate with `npm run build`) ----
+dist/
+dist-ssr/
+*.local
+.vite/
+.cache/
+coverage/
+
+# ---- local agent state (contains session transcripts, not product code) ----
+.remember/
+.claude/
+.agents/
+.ao/
+.cursor/
+.windsurf/
+.continue/
+
+# ---- logs ----
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# ---- local scratch ----
+*.tmp
+*.bak
+scratch/
+tmp/
