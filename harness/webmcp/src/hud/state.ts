@@ -1,4 +1,7 @@
+import { toggleTier, type ModelTier } from '../mcp/tier';
+
 export type HUDStatus = 'IDLE' | 'LISTENING' | 'PROCESSING' | 'ALERT';
+export type { ModelTier };
 export type ReticleStatus = 'nominal' | 'warning' | 'breach';
 
 export interface Reticle {
@@ -21,6 +24,18 @@ export interface HUDState {
   };
   reticles: Reticle[];
   audioLevel: number;
+  /** which Spark route the HUD asks the proxy for; toggled with `F` */
+  modelTier: ModelTier;
+  /**
+   * Last serving facts the proxy reported. `lastError` drives the warning pill and is the only
+   * field here that a failure writes - the reticles are never cleared by a failed call.
+   */
+  proxy: {
+    modelId: string;
+    cached: boolean | null;
+    ledgerSpentUsd: number | null;
+    lastError: string | null;
+  };
 }
 
 type Listener = (state: HUDState) => void;
@@ -42,6 +57,8 @@ class HUDStore {
       },
     ],
     audioLevel: 15,
+    modelTier: 'primary',
+    proxy: { modelId: '', cached: null, ledgerSpentUsd: null, lastError: null },
   };
 
   private listeners: Set<Listener> = new Set();
@@ -67,6 +84,30 @@ class HUDStore {
 
   setTelemetry(telemetry: Partial<HUDState['telemetry']>) {
     this.state.telemetry = { ...this.state.telemetry, ...telemetry };
+    this.notify();
+  }
+
+  /** set by the F hotkey and by any response that reports a different tier than requested */
+  setModelTier(tier: ModelTier) {
+    if (this.state.modelTier === tier) return;
+    this.state.modelTier = tier;
+    this.notify();
+  }
+
+  toggleModelTier(): ModelTier {
+    this.state.modelTier = toggleTier(this.state.modelTier);
+    this.notify();
+    return this.state.modelTier;
+  }
+
+  setProxyTelemetry(patch: Partial<HUDState['proxy']>) {
+    this.state.proxy = { ...this.state.proxy, ...patch };
+    this.notify();
+  }
+
+  clearProxyError() {
+    if (this.state.proxy.lastError === null) return;
+    this.state.proxy = { ...this.state.proxy, lastError: null };
     this.notify();
   }
 

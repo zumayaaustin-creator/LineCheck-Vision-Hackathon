@@ -145,7 +145,41 @@ export const toolDefinitions = [
   },
 ];
 
+/**
+ * Validate a tool call against the schema Spark was given, before any handler runs.
+ *
+ * Spark is handed these definitions (the proxy injects `tools.json` when a caller forgets), but a
+ * stale prompt or an older integration can still send the wrong field names - the earlier design
+ * used `item` / `quantity` / `unit` instead of `ingredient` / `weight_g`. Without this guard,
+ * `record_waste` throws a TypeError on `undefined.toUpperCase()` inside a path that is supposed to
+ * degrade, and the HUD loses the screen it was drawing.
+ */
+export function validateArgs(name: string, args: Record<string, unknown>): string | null {
+  const def = toolDefinitions.find((d) => d.name === name);
+  if (!def) return null; // unknown tools are the switch default's problem, and still throw
+
+  const required = def.parameters.required;
+  const missing = required.filter((key) => args[key] === undefined || args[key] === null);
+  if (missing.length > 0) {
+    return `missing ${missing.join(', ')} - expected ${required.join(', ')}`;
+  }
+
+  const properties = def.parameters.properties as unknown as Record<string, { type?: string }>;
+  for (const [key, spec] of Object.entries(properties)) {
+    const value = args[key];
+    if (value === undefined) continue;
+    if (spec.type === 'number' && typeof value !== 'number') return `${key} must be a number`;
+    if (spec.type === 'string' && typeof value !== 'string') return `${key} must be a string`;
+  }
+  return null;
+}
+
 export async function executeTool(name: string, args: Record<string, unknown>) {
+  const invalid = validateArgs(name, args);
+  if (invalid) {
+    return { success: false, code: 'INVALID_ARGS', error: `Tool "${name}" rejected: ${invalid}` };
+  }
+
   switch (name) {
     case 'record_waste':
       return record_waste(args as unknown as RecordWasteParams);

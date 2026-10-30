@@ -2,6 +2,15 @@ import mockDetections from '../../mock-device-kit/mockDetections.json';
 import type { ContainerTarget } from '../types/hud';
 import { env, shouldUseMock, mockReason, HUD_SIZE } from '../config/env';
 import { normalizeToHud, type RawDetection, type SourceFrame } from './normalize';
+import { hudStore } from '../hud/state';
+import {
+  classifyTierRefusal,
+  readTelemetry,
+  sparkRequestInit,
+  type ModelTier,
+  type ProxyTelemetry,
+  type TierRefusal,
+} from './tier';
 
 export interface VisionResponse {
   source: 'live_meta_api' | 'local_mock_cache';
@@ -15,6 +24,16 @@ export interface VisionResponse {
 export interface ToolCall {
   name: string;
   arguments: Record<string, unknown>;
+}
+
+export interface ResolvedTool {
+  toolCall: ToolCall;
+  source: 'live_meta_api' | 'local_mock_cache';
+  confidence: number;
+  /** serving facts the proxy reported for this call (`_meta`, or the response headers) */
+  telemetry: ProxyTelemetry;
+  /** set when the proxy refused the requested tier; the caller still got a fallback pick */
+  refused: TierRefusal | null;
 }
 
 export interface SpendUsage {
@@ -167,7 +186,8 @@ export class MetaModelClient {
   async resolveTool(
     transcript: string,
     tools: Array<{ name: string }>,
-  ): Promise<{ toolCall: ToolCall; source: 'live_meta_api' | 'local_mock_cache'; confidence: number }> {
+    tier: ModelTier = 'primary',
+  ): Promise<ResolvedTool> {
     // offline fallback: pick by keyword using the same rules the mock uses
     const localFallback = (): { toolCall: ToolCall; confidence: number } => {
       const low = transcript.toLowerCase();
@@ -183,33 +203,83 @@ export class MetaModelClient {
       return { toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '4-inch Hotel Pan', fill_percentage: 15 } }, confidence: 0.6 };
     };
 
+    const offline = (
+      telemetry: ProxyTelemetry,
+      refused: TierRefusal | null = null,
+    ): ResolvedTool => ({ ...localFallback(), source: 'local_mock_cache', telemetry, refused });
+
     if (shouldUseMock() || !env.museSparkEndpoint) {
-      const f = localFallback();
-      return { ...f, source: 'local_mock_cache' };
+      return offline({
+        modelTier: null,
+        modelId: '',
+        cached: null,
+        ledgerSpentUsd: null,
+        lastError: null,
+      });
     }
 
-    const response = await fetch(env.museSparkEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
-      },
-      body: JSON.stringify({ transcript, tools }),
-    });
-    if (!response.ok) throw new Error(`Muse Spark HTTP ${response.status}`);
+    const response = await fetch(
+      env.museSparkEndpoint,
+      sparkRequestInit(transcript, tools, tier, env.metaApiKey),
+    );
+
+    if (!response.ok) {
+      let payload: unknown = null;
+      try {
+        payload = await response.json();
+      } catch {
+        /* an empty or non-JSON error body is still an error, just an unlabelled one */
+      }
+
+      const refusal = classifyTierRefusal(response.status, payload);
+      if (refusal) {
+        // A misconfigured tier is a state change, not an exception: the reticles already on
+        // screen stay exactly as they are, the next frame draws a warning pill, and the user
+        // still gets a locally-resolved tool so the HUD keeps working.
+        const telemetry: ProxyTelemetry = {
+          modelTier: tier,
+          modelId: '',
+          cached: null,
+          ledgerSpentUsd: null,
+          lastError: refusal.message,
+        };
+        hudStore.setProxyTelemetry({
+          modelId: telemetry.modelId,
+          cached: telemetry.cached,
+          ledgerSpentUsd: telemetry.ledgerSpentUsd,
+          lastError: refusal.message,
+        });
+        console.warn(`[HUD] ${refusal.message} - falling back to local dispatch`);
+        return offline(telemetry, refusal);
+      }
+
+      throw new Error(`Muse Spark HTTP ${response.status}`);
+    }
 
     const data = (await response.json()) as {
       tool?: { name?: string; arguments?: Record<string, unknown> };
       confidence?: number;
+      _meta?: Record<string, unknown>;
     };
+
+    const telemetry = readTelemetry(data, response.headers);
+    hudStore.setModelTier(telemetry.modelTier ?? tier);
+    hudStore.setProxyTelemetry({
+      modelId: telemetry.modelId,
+      cached: telemetry.cached,
+      ledgerSpentUsd: telemetry.ledgerSpentUsd,
+      lastError: null,
+    });
+
     if (!data.tool?.name) {
-      const f = localFallback();
-      return { ...f, source: 'local_mock_cache' };
+      return { ...localFallback(), source: 'local_mock_cache', telemetry, refused: null };
     }
     return {
       toolCall: { name: data.tool.name, arguments: data.tool.arguments ?? {} },
       source: 'live_meta_api',
       confidence: data.confidence ?? 0,
+      telemetry,
+      refused: null,
     };
   }
 

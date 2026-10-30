@@ -1,4 +1,5 @@
-import { hudStore, Reticle } from './hud/state';
+import { hudStore, Reticle, type HUDState } from './hud/state';
+import { footerText } from './mcp/tier';
 import { executeTool, toolDefinitions } from './mcp/tools';
 import { metaClient } from './mcp/client';
 import { normalizeToHud } from './mcp/normalize';
@@ -43,7 +44,21 @@ setInterval(() => { void refreshBudget(); }, 10000);
  * SAM 3.1 is snapshot-only (see triggerSnapshot) so an animation frame can never spend
  * credits.
  */
-function render() {
+/**
+ * Strip geometry, declared before the first draw call.
+ *
+ * `render()` runs at module scope, so these must be initialised before it is reached - a `const`
+ * placed next to the drawing functions below would be in its temporal dead zone when the first
+ * frame is drawn, which is a blank HUD and a ReferenceError, not a layout bug.
+ *
+ * The strip sits above the HTML `.hud-footer` (which overlays the last ~24px of the frame).
+ */
+const FOOTER_STRIP_H = 18;
+const FOOTER_STRIP_GAP = 26;
+const FOOTER_STRIP_Y = HUD_SIZE - FOOTER_STRIP_GAP - FOOTER_STRIP_H;
+const WARNING_PILL_H = 18;
+
+function drawFrame() {
   if (!ctx || !canvas) return;
   ctx.clearRect(0, 0, HUD_SIZE, HUD_SIZE);
 
@@ -105,9 +120,101 @@ function render() {
     ctx.restore();
   });
 
+  // Drawn last, so a reticle can never sit on top of the telemetry strip or the warning pill.
+  drawTelemetryFooter(state);
+  drawTierWarning(state);
+}
+
+/** the continuous loop; `F` calls drawFrame() directly so the footer is honest immediately */
+function render(): void {
+  drawFrame();
   requestAnimationFrame(render);
 }
 render();
+
+/**
+ * Clamped telemetry strip inside the 600x600 boundary.
+ *
+ * Sits above the HTML `.hud-footer` (which overlays the last ~24px of the frame) rather than
+ * under it, and clips itself, so nothing it draws can leave the canvas or cover the footer.
+ */
+function drawTelemetryFooter(state: HUDState): void {
+  if (!ctx) return;
+  const tierColor = state.modelTier === 'open-weights' ? '#BD00FF' : '#00F0FF';
+  const y = FOOTER_STRIP_Y;
+  const midY = y + FOOTER_STRIP_H / 2 + 1;
+
+  ctx.fillStyle = '#050505';
+  ctx.fillRect(0, y, HUD_SIZE, FOOTER_STRIP_H);
+  ctx.strokeStyle = tierColor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, y + 0.5);
+  ctx.lineTo(HUD_SIZE, y + 0.5);
+  ctx.stroke();
+
+  const seg = footerText({
+    modelTier: state.modelTier,
+    modelId: state.proxy.modelId,
+    cached: state.proxy.cached,
+    ledgerSpentUsd: state.proxy.ledgerSpentUsd,
+  });
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, y, HUD_SIZE, FOOTER_STRIP_H);
+  ctx.clip();
+  ctx.font = 'bold 10px monospace';
+  ctx.textBaseline = 'middle';
+
+  const right = `${seg.cache}  ${seg.ledger}`;
+  const rightWidth = ctx.measureText(right).width;
+  const margin = 12;
+  const maxLeft = HUD_SIZE - margin * 2 - rightWidth;
+
+  // Degrade rather than overprint: full label, then tier only, then nothing. The ledger side is
+  // the part that must survive, because it is the number that costs money.
+  let left = `${seg.model}  ${seg.tier}`;
+  if (ctx.measureText(left).width > maxLeft) left = seg.tier;
+  if (ctx.measureText(left).width > maxLeft) left = '';
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = tierColor;
+  ctx.fillText(left, margin, midY);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#FCEE0A';
+  ctx.fillText(right, HUD_SIZE - margin, midY);
+  ctx.restore();
+}
+
+/**
+ * Tier warning pill. Nothing in here touches `reticles` or `status`: a refused tier is a
+ * configuration notice, not a reason to blank the screen.
+ */
+function drawTierWarning(state: HUDState): void {
+  if (!ctx) return;
+  const message = state.proxy.lastError;
+  if (!message) return;
+
+  ctx.save();
+  ctx.font = 'bold 10px monospace';
+  ctx.textBaseline = 'middle';
+  const width = Math.min(HUD_SIZE - 24, Math.ceil(ctx.measureText(message).width) + 16);
+  const x = 12;
+  const y = FOOTER_STRIP_Y - WARNING_PILL_H - 6;
+  ctx.fillStyle = 'rgba(5, 5, 5, 0.92)';
+  ctx.fillRect(x, y, width, WARNING_PILL_H);
+  ctx.strokeStyle = '#BD00FF';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, width - 1, WARNING_PILL_H - 1);
+  ctx.beginPath();
+  ctx.rect(x, y, width, WARNING_PILL_H);
+  ctx.clip();
+  ctx.fillStyle = '#BD00FF';
+  ctx.fillText(message, x + 8, y + WARNING_PILL_H / 2 + 1);
+  ctx.restore();
+}
 
 // Console exposure
 (window as any).executeTool = executeTool;
@@ -204,8 +311,15 @@ async function triggerVoice(hint?: string) {
     console.log(`[HUD] 1/3 transcribe (${result.source}): "${result.transcription}"`);
 
     // step 2: Muse Spark 1.3 selects a tool from the transcript
-    const picked = await metaClient.resolveTool(result.transcription, toolDefinitions);
-    console.log(`[HUD] 2/3 spark (${picked.source}, conf ${picked.confidence}): ${picked.toolCall.name}`);
+    const picked = await metaClient.resolveTool(
+      result.transcription,
+      toolDefinitions,
+      hudStore.getState().modelTier,
+    );
+    console.log(
+      `[HUD] 2/3 spark (${picked.source}, conf ${picked.confidence}, tier ${picked.telemetry.modelTier ?? 'n/a'}` +
+        `${picked.refused ? `, REFUSED ${picked.refused.code}` : ''}): ${picked.toolCall.name}`,
+    );
 
     // step 3: WebMCP execution
     console.log('[HUD] 3/3 execute', picked.toolCall.name, JSON.stringify(picked.toolCall.arguments));
@@ -317,6 +431,14 @@ window.addEventListener('keydown', async (e) => {
       camera.stop();
       await initCamera();
       break;
+    case 'f':
+    case 'F': {
+      const tier = hudStore.toggleModelTier();
+      console.log(`[HUD] model tier -> ${tier}`);
+      hudStore.clearProxyError(); // the old refusal belonged to the old tier
+      drawFrame(); // rAF would pick this up next frame; redraw now so the footer cannot lag
+      break;
+    }
     case '1':
       console.log('[HUD] tare_scale');
       await executeTool('tare_scale', { unit: 'g' });
