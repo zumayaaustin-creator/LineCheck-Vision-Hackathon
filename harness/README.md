@@ -273,6 +273,64 @@ Other knobs: `PROXY_PORT`, `PROXY_TIMEOUT_MS` (30 s), `PROXY_ALLOWED_ORIGINS` (C
 
 ---
 
+### Model tiers - primary vs open-weights
+
+`/muse-spark/dispatch` can be served from two places, chosen per request:
+
+| header | tier | upstream | key |
+|---|---|---|---|
+| *(absent)* | `primary` | `META_MUSE_SPARK_URL` (or `UPSTREAM_BASE`) | `META_API_KEY` |
+| `x-model-tier: open-weights` | `open-weights` | `META_OPEN_WEIGHTS_SPARK_URL` (or `BASETEN_MODAL_OPEN_URL`) | `BASETEN_API_KEY` / `MODAL_API_KEY`, else `META_API_KEY` |
+
+The same tier can be requested in the JSON body as `"tier": "open-weights"` - the header wins.
+SAM and Muse audio are not tiered; the header is ignored on those routes.
+
+Every JSON response is stamped so the HUD footer can name the route that actually served it
+without a second call to `/__usage`:
+
+```json
+"_meta": {
+  "activeRoute": "spark", "modelTier": "open-weights", "modelId": "muse-spark-open-1026",
+  "cached": false, "costUsd": 0.03, "actualCostUsd": null,
+  "ledgerSpentUsd": 0.0371, "sessionSpendUsd": 0.0371, "cacheHits": 0
+}
+```
+
+The same values ride on `X-Model-Tier`, `X-Model-Id` and `X-Proxy-Ledger-Usd`, which are listed
+in `Access-Control-Expose-Headers` so browser code can read them. Stamping happens **when the
+response is served, never before it is cached** - a cached body must not carry another run's
+ledger total.
+
+Three refusals, all `400` and all before any charge:
+
+| error | when |
+|---|---|
+| `unknown_model_tier` | the header names something other than `primary` / `open-weights` |
+| `tier_not_configured` | the tier exists but its URL env var is unset |
+
+Neither falls back silently: a typo must not spend on the expensive route while reporting the
+cheap one, and a misrouted open-weights call must not be labelled open-weights while hitting
+Meta.
+
+**The tier is part of the replay-cache key** (`route:spark:<tier>`). Without it, an identical
+transcript would replay the primary answer for an open-weights request at $0.00 and the HUD would
+name the wrong model - see commit history for the test that pins this.
+
+Cost stays a flat per-call floor (`COST_PER_OPEN_WEIGHTS_CALL_USD`, default = the Spark cost)
+because the proxy never sees an invoice line; it reconciles against whatever the upstream
+reports and otherwise keeps the floor.
+
+#### Tool schemas in the payload
+
+Spark needs the tool definitions to pick one. The HUD sends them, but a bare `curl` does not, so
+the proxy injects `harness/webmcp/tools.json` when the body has no `tools` array - **before** the
+cache key is computed, so replay stays deterministic. That file is generated from
+`webmcp/src/mcp/tools.ts`, which stays the single source of truth:
+
+```
+cd harness/webmcp && npm run gen:tools
+```
+
 ## Microphone capture
 
 `harness/webmcp/src/mic.ts` records one bounded window (2.2 s) via `getUserMedia` +

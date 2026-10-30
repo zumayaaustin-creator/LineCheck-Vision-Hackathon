@@ -1,0 +1,95 @@
+[
+  {
+    "name": "record_waste",
+    "description": "Logs kitchen prep scrap or spoil waste directly onto the HUD with weight and reason.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ingredient": {
+          "type": "string",
+          "description": "Name of the ingredient (e.g., pork shoulder, onions)"
+        },
+        "weight_g": {
+          "type": "number",
+          "description": "Grams wasted or trimmed"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason for waste (e.g., spoilage, silver skin, fat trim)"
+        }
+      },
+      "required": [
+        "ingredient",
+        "weight_g",
+        "reason"
+      ]
+    }
+  },
+  {
+    "name": "calculate_yield",
+    "description": "Calculates culinary yield percentage (EP / AP * 100) and displays the calculation on the HUD.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ap_weight_g": {
+          "type": "number",
+          "description": "As Purchased weight in grams"
+        },
+        "ep_weight_g": {
+          "type": "number",
+          "description": "Edible Portion weight in grams"
+        },
+        "trim_weight_g": {
+          "type": "number",
+          "description": "Optional trim weight in grams"
+        }
+      },
+      "required": [
+        "ap_weight_g",
+        "ep_weight_g"
+      ]
+    }
+  },
+  {
+    "name": "tare_scale",
+    "description": "Zeroes the virtual or hardware scale readout and draws a calibration reticle.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "unit": {
+          "type": "string",
+          "enum": [
+            "g",
+            "oz",
+            "lbs"
+          ],
+          "description": "Measurement unit"
+        }
+      },
+      "required": [
+        "unit"
+      ]
+    }
+  },
+  {
+    "name": "verify_pan_depth",
+    "description": "Validates line prep container fill level against par and marks warning if under 20% or over 90%.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "pan_type": {
+          "type": "string",
+          "description": "Pan size (e.g., 1/6 pan, 1/9 pan, hotel pan)"
+        },
+        "fill_percentage": {
+          "type": "number",
+          "description": "Current estimated fill percentage (0-100)"
+        }
+      },
+      "required": [
+        "pan_type",
+        "fill_percentage"
+      ]
+    }
+  }
+]

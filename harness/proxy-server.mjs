@@ -67,10 +67,51 @@ const SPARK_URL = process.env.META_MUSE_SPARK_URL || (UPSTREAM_BASE ? `${UPSTREA
 
 const API_KEY = process.env.META_API_KEY || '';
 
+// ---------------------------------------------------------------- model tiers (Spark only)
+/**
+ * Muse Spark can be served from two places, chosen per request by the `x-model-tier` header (or
+ * a `tier` field in the JSON body):
+ *
+ *   primary       Meta-hosted Spark. The default. Flat cost = COST.spark per call.
+ *   open-weights  the open-weight build on Baseten or Modal (the hackathon partner credits).
+ *
+ * Deliberate choices, each one guarding a specific way this could go wrong:
+ *  - The tier is part of the replay-cache key. Without that, a primary response would be
+ *    replayed for an open-weights request and the HUD would name the wrong model at $0.00.
+ *  - An unknown tier is a 400, never a silent fall back to primary: a typo must not quietly
+ *    spend on the expensive route while reporting the cheap one.
+ *  - A tier whose URL is unset is a 400 too. Falling back to the Meta endpoint while labelling
+ *    the response "open-weights" would be a lie in the ledger and a split cache for nothing.
+ *  - Cost stays a flat per-call floor like every other route in this file. Per-1k-token prices
+ *    are NOT applied here because this proxy never sees an invoice line; it reconciles against
+ *    whatever the upstream reports (actualCostFrom below) and otherwise keeps the floor.
+ */
+const MODEL_TIERS = {
+  primary: {
+    id: process.env.META_PRIMARY_MODEL || 'muse-spark-1.3',
+    url: () => SPARK_URL,
+    key: () => process.env.META_API_KEY || '',
+    cost: () => COST.spark,
+  },
+  'open-weights': {
+    id: process.env.META_OPEN_WEIGHTS_MODEL || 'muse-spark-open-1026',
+    url: () => process.env.META_OPEN_WEIGHTS_SPARK_URL || process.env.BASETEN_MODAL_OPEN_URL || '',
+    // falls back to the Meta key when the partner key is unset; warned about at boot
+    key: () => process.env.BASETEN_API_KEY || process.env.MODAL_API_KEY || process.env.META_API_KEY || '',
+    cost: () => COST.openWeights,
+  },
+};
+const DEFAULT_TIER = 'primary';
+
 const COST = {
   sam:   Number(process.env.COST_PER_SAM_CALL_USD   ?? 0.05),
   muse:  Number(process.env.COST_PER_MUSE_AUDIO_USD ?? 0.02),
   spark: Number(process.env.COST_PER_MUSE_SPARK_USD ?? 0.03),
+  // the open-weight route is cheaper, but the floor stays conservative until a real invoice
+  // says otherwise: set COST_PER_OPEN_WEIGHTS_CALL_USD once Baseten/Modal usage is known.
+  openWeights: Number(
+    process.env.COST_PER_OPEN_WEIGHTS_CALL_USD ?? process.env.COST_PER_MUSE_SPARK_USD ?? 0.03,
+  ),
 };
 
 const MAX_PAID_CALLS        = Number(process.env.MAX_PAID_CALLS ?? 60);
@@ -230,7 +271,9 @@ function corsFor(req) {
   return {
     'Access-Control-Allow-Origin': ok ? origin : ALLOWED_ORIGINS[0],
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, x-model-tier',
+    'Access-Control-Expose-Headers':
+      'X-Proxy-Cache, X-Proxy-Cost, X-Proxy-Cost-Actual, X-Model-Tier, X-Model-Id, X-Proxy-Ledger-Usd',
     'Access-Control-Max-Age': '600',
     Vary: 'Origin',
   };
@@ -354,6 +397,54 @@ async function recordUsageSample(routePath, status, body, headers, reconciliatio
   }
 }
 
+// ---------------------------------------------------------------- tier + payload helpers
+/** the tool schemas Spark is given when a caller forgets to send them */
+let FALLBACK_TOOLS = null;
+function loadFallbackTools() {
+  if (FALLBACK_TOOLS !== null) return FALLBACK_TOOLS;
+  const toolsPath = process.env.PROXY_TOOLS_PATH || 'harness/webmcp/tools.json';
+  try {
+    const parsed = JSON.parse(readFileSync(toolsPath, 'utf8'));
+    FALLBACK_TOOLS = Array.isArray(parsed) ? parsed : [];
+    if (FALLBACK_TOOLS.length) log(`TOOLS loaded ${FALLBACK_TOOLS.length} schemas from ${toolsPath}`);
+  } catch {
+    FALLBACK_TOOLS = []; // no fallback file: forward the body exactly as received
+  }
+  return FALLBACK_TOOLS;
+}
+
+/**
+ * Resolve the model tier for a request. Only the Spark route is tiered; SAM and Muse audio have
+ * exactly one home each.
+ */
+function resolveTier(routeKey, headers, body) {
+  if (routeKey !== 'spark') return { tier: null, error: null };
+  const headerTier = String(headers['x-model-tier'] || '').trim().toLowerCase();
+  const bodyTier = typeof body?.tier === 'string' ? body.tier.trim().toLowerCase() : '';
+  const requested = headerTier || bodyTier || DEFAULT_TIER;
+  const cfg = MODEL_TIERS[requested];
+  if (!cfg) return { tier: requested, error: 'unknown_model_tier' };
+  if (!cfg.url()) return { tier: requested, error: 'tier_not_configured' };
+  return { tier: requested, error: null };
+}
+
+/**
+ * Stamp a JSON response with _meta so the HUD footer can show which route served it and what the
+ * ledger has spent, without a second round trip to /__usage. Non-JSON bodies pass through
+ * untouched - the same values ride on the response headers for those.
+ */
+function stampMeta(body, contentType, meta) {
+  if (!String(contentType).includes('json')) return body;
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return body;
+    parsed._meta = { ...(parsed._meta || {}), ...meta };
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return body; // an upstream that lied about its content-type is not our problem
+  }
+}
+
 // ---------------------------------------------------------------- boot guards
 if (!API_KEY) {
   console.error('[proxy] FATAL: META_API_KEY is not set. The key belongs here, never in VITE_*.');
@@ -364,6 +455,10 @@ for (const [route, cfg] of Object.entries(ROUTES)) {
     console.error(`[proxy] FATAL: no upstream for ${route}. Set its META_*_URL, or UPSTREAM_BASE.`);
     process.exit(1);
   }
+}
+
+if (MODEL_TIERS['open-weights'].url() && !process.env.BASETEN_API_KEY && !process.env.MODAL_API_KEY) {
+  log('WARN: open-weights tier has a URL but no BASETEN_API_KEY/MODAL_API_KEY - it will send the Meta key');
 }
 
 // ---------------------------------------------------------------- server
@@ -422,6 +517,14 @@ const server = createServer(async (req, res) => {
       maxSessionSpendUsd: MAX_SESSION_SPEND_USD,
       byRoute: ledger.byRoute,
       cacheMode: CACHE_MODE,
+      modelTiers: {
+        default: DEFAULT_TIER,
+        routes: Object.fromEntries(Object.entries(MODEL_TIERS).map(([name, cfg]) => [name, {
+          id: cfg.id,
+          configured: Boolean(cfg.url()),
+          costPerCallUsd: cfg.cost(),
+        }])),
+      },
       updatedAtUtc: ledger.updatedAtUtc,
     });
     return;
@@ -433,10 +536,58 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  const raw = await readBody(req);
+  let raw = await readBody(req);
   const ctype = String(req.headers['content-type'] || 'application/json');
-  const hash = cacheKeyFor(route.key, ctype, raw);
-  const nextCost = route.cost;
+
+  // ---- 0a. the Spark payload always carries the tool schemas ----
+  // The HUD sends them, but a direct curl used to reach Spark with no tools at all, and a model
+  // with no tools answers in prose the HUD cannot execute. Injection happens BEFORE the cache
+  // key is computed, so the replay cache stays deterministic across both callers.
+  if (route.key === 'spark' && ctype.includes('json') && raw.length) {
+    try {
+      const parsed = JSON.parse(raw.toString('utf8'));
+      if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {
+        const fallback = loadFallbackTools();
+        if (fallback.length) {
+          raw = Buffer.from(JSON.stringify({ ...parsed, tools: fallback }), 'utf8');
+          log(`INJECT ${fallback.length} tool schemas -> ${url.pathname}`);
+        }
+      }
+    } catch { /* not JSON: forward untouched */ }
+  }
+
+  // ---- 0b. model tier (Spark only) ----
+  let tier = null;
+  let tierCfg = null;
+  if (route.key === 'spark') {
+    let parsedBody = null;
+    if (ctype.includes('json') && raw.length) {
+      try { parsedBody = JSON.parse(raw.toString('utf8')); } catch { parsedBody = null; }
+    }
+    const resolved = resolveTier(route.key, req.headers, parsedBody);
+    if (resolved.error) {
+      log(`REFUSED ${url.pathname}: ${resolved.error} (${resolved.tier})`);
+      json(req, res, 400, {
+        error: resolved.error,
+        tier: resolved.tier,
+        message: resolved.error === 'unknown_model_tier'
+          ? `Unknown model tier "${resolved.tier}". Known tiers: ${Object.keys(MODEL_TIERS).join(', ')}.`
+          : `Tier "${resolved.tier}" has no upstream URL configured. Set META_OPEN_WEIGHTS_SPARK_URL.`,
+        knownTiers: Object.keys(MODEL_TIERS),
+      });
+      return;
+    }
+    tier = resolved.tier;
+    tierCfg = MODEL_TIERS[tier];
+  }
+
+  const activeUpstream = tierCfg ? tierCfg.url() : route.upstream;
+  const activeKey = tierCfg ? tierCfg.key() : API_KEY;
+  const activeModelId = tierCfg ? tierCfg.id : 'n/a';
+
+  // the tier is part of the key: a primary answer must never be replayed for an open-weight ask
+  const hash = cacheKeyFor(tier ? `${route.key}:${tier}` : route.key, ctype, raw);
+  const nextCost = tierCfg ? tierCfg.cost() : route.cost;
 
   // ---- 1. replay cache: a hit costs nothing and never touches upstream ----
   const cached = await readCache(hash);
@@ -444,13 +595,26 @@ const server = createServer(async (req, res) => {
     ledger.cacheHits += 1;
     saveLedger();
     log(`CACHE HIT ${url.pathname} ${hash.slice(0, 12)} -> $0.00 (${ledger.cacheHits} hits)`);
+    const hitBody = stampMeta(cached.body, cached.contentType || 'application/json', {
+      activeRoute: route.key,
+      modelTier: tier,
+      modelId: activeModelId,
+      cached: true,
+      costUsd: 0,
+      ledgerSpentUsd: round6(ledger.totalSpendUsd),
+      sessionSpendUsd: round6(sessionSpendUsd),
+      cacheHits: ledger.cacheHits,
+    });
     res.writeHead(cached.status ?? 200, {
       'Content-Type': cached.contentType || 'application/json',
-      'Content-Length': Buffer.byteLength(cached.body),
+      'Content-Length': Buffer.byteLength(hitBody),
       'X-Proxy-Cache': 'hit',
+      'X-Model-Tier': tier || 'n/a',
+      'X-Model-Id': activeModelId,
+      'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
       ...corsFor(req),
     });
-    res.end(cached.body);
+    res.end(hitBody);
     return;
   }
 
@@ -498,9 +662,9 @@ const server = createServer(async (req, res) => {
   ledger.byRoute[route.key].spendUsd = round6(ledger.byRoute[route.key].spendUsd + nextCost);
   saveLedger();
 
-  log(`#${ledger.paidCalls} ${url.pathname} $${nextCost.toFixed(2)} (lifetime $${ledger.totalSpendUsd.toFixed(2)}/${MAX_SPEND_USD}, session $${sessionSpendUsd.toFixed(2)}/${MAX_SESSION_SPEND_USD})`);
+  log(`#${ledger.paidCalls} ${url.pathname}${tier ? ` [${tier}]` : ''} $${nextCost.toFixed(2)} (lifetime $${ledger.totalSpendUsd.toFixed(2)}/${MAX_SPEND_USD}, session $${sessionSpendUsd.toFixed(2)}/${MAX_SESSION_SPEND_USD})`);
 
-  const upstreamUrl = route.upstream + (url.search || '');
+  const upstreamUrl = activeUpstream + (url.search || '');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Number(process.env.PROXY_TIMEOUT_MS || 30000));
 
@@ -508,7 +672,7 @@ const server = createServer(async (req, res) => {
     const upstream = await fetch(upstreamUrl, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${API_KEY}`, // credential never leaves the server
+        Authorization: `Bearer ${activeKey}`, // credential never leaves the server
         ...(ctype.includes('multipart') ? {} : { 'Content-Type': ctype || 'application/json' }),
       },
       body: raw.length ? raw : undefined,
@@ -584,15 +748,30 @@ const server = createServer(async (req, res) => {
       upstream: upstreamUrl.replace(/\/\/.*@/, '//'),
     });
 
+    const servedBody = stampMeta(text, upstream.headers.get('content-type') || 'application/json', {
+      activeRoute: route.key,
+      modelTier: tier,
+      modelId: activeModelId,
+      cached: false,
+      costUsd: nextCost,
+      actualCostUsd: reconciliation.actualUsd,
+      ledgerSpentUsd: round6(ledger.totalSpendUsd),
+      sessionSpendUsd: round6(sessionSpendUsd),
+      cacheHits: ledger.cacheHits,
+    });
+
     res.writeHead(upstream.status, {
       'Content-Type': upstream.headers.get('content-type') || 'application/json',
-      'Content-Length': Buffer.byteLength(text),
+      'Content-Length': Buffer.byteLength(servedBody),
       'X-Proxy-Cost': nextCost.toFixed(3),
       'X-Proxy-Cost-Actual': reconciliation.actualUsd === null ? 'unknown' : String(reconciliation.actualUsd),
       'X-Proxy-Cache': cached ? 'miss-recorded' : 'miss',
+      'X-Model-Tier': tier || 'n/a',
+      'X-Model-Id': activeModelId,
+      'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
       ...corsFor(req),
     });
-    res.end(text);
+    res.end(servedBody);
   } catch (err) {
     const aborted = err?.name === 'AbortError';
     ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd - nextCost));
@@ -621,6 +800,10 @@ server.listen(PORT, HOST, () => {
   console.log(`  lifetime: $${ledger.totalSpendUsd.toFixed(2)} / $${MAX_SPEND_USD}   (${ledger.paidCalls} calls, ${ledger.cacheHits} cache hits)`);
   console.log(`  session : $${sessionSpendUsd.toFixed(2)} / $${MAX_SESSION_SPEND_USD}   (resets on restart)`);
   console.log(`  calls   : ${ledger.paidCalls} / ${MAX_PAID_CALLS}`);
+  for (const [name, cfg] of Object.entries(MODEL_TIERS)) {
+    const url = cfg.url() || '(not configured)';
+    console.log(`  tier    : ${name.padEnd(13)} ${cfg.id}  $${cfg.cost()}  -> ${url}`);
+  }
   console.log(`  cache   : ${CACHE_MODE} -> ${CACHE_DIR}`);
   console.log(`  ledger  : ${LEDGER_PATH}`);
   console.log('');

@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "build:test": "tsc src/mcp/normalize.ts src/config/constants.ts src/types/hud.ts src/wakeword.ts --outDir .testdist --module commonjs --target es2022 --moduleResolution node --lib es2022,dom --skipLibCheck --esModuleInterop --resolveJsonModule --noEmitOnError false && node -e \"require('fs').writeFileSync('.testdist/package.json', JSON.stringify({type:'commonjs'}))\"",
-    "test": "npm run build:test && node --test tests/normalize.test.cjs tests/wakeword.test.cjs"
+    "test": "npm run build:test && node --test tests/normalize.test.cjs tests/wakeword.test.cjs",
+    "gen:tools": "node scripts/gen-tools-json.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
