@@ -435,7 +435,11 @@ window.addEventListener('keydown', async (e) => {
     case 'F': {
       const tier = hudStore.toggleModelTier();
       console.log(`[HUD] model tier -> ${tier}`);
-      hudStore.clearProxyError(); // the old refusal belonged to the old tier
+      // Everything below belonged to the tier we just left: the model id and the cache verdict
+      // were facts about the OLD route, and leaving them on screen next to the new tier is a
+      // contradiction the footer should never show. The ledger is tier-independent, so it stays.
+      hudStore.setProxyTelemetry({ modelId: '', cached: null });
+      hudStore.clearProxyError();
       drawFrame(); // rAF would pick this up next frame; redraw now so the footer cannot lag
       break;
     }
