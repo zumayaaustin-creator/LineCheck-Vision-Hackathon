@@ -103,6 +103,29 @@ const MODEL_TIERS = {
 };
 const DEFAULT_TIER = 'primary';
 
+// ---------------------------------------------------------------- Spark wire protocol
+/**
+ * The linecheck contract (what the HUD speaks) is `{transcript, tools}` in,
+ * `{tool:{name,arguments}}` out. Meta Model API speaks OpenAI: chat messages + `tools` in,
+ * `choices[0].message.tool_calls[]` out. Rather than teach the browser two dialects, the proxy
+ * translates when `PROXY_SPARK_PROTOCOL=openai`:
+ *
+ *   PROXY_SPARK_PROTOCOL   linecheck (default) | openai
+ *   META_SPARK_MODEL       model id sent upstream          (default muse-spark-1.3)
+ *   PROXY_SPARK_MAX_TOKENS max_tokens for the live call    (default 256)
+ *   PROXY_SPARK_SYSTEM     system prompt; a tool-calling bias, because prose is unusable here
+ *
+ * Translation happens BEFORE the cache key is computed, so the key covers the translated payload:
+ * switching protocol invalidates the cache instead of replaying a body shaped for the other one.
+ */
+const SPARK_PROTOCOL = (process.env.PROXY_SPARK_PROTOCOL || 'linecheck').toLowerCase();
+const SPARK_MODEL = process.env.META_SPARK_MODEL || 'muse-spark-1.3';
+const SPARK_MAX_TOKENS = Number(process.env.PROXY_SPARK_MAX_TOKENS ?? 256);
+const SPARK_SYSTEM =
+  process.env.PROXY_SPARK_SYSTEM ||
+  'You are LineCheck, a kitchen HUD assistant. Call exactly one tool that completes the request. ' +
+  'Never answer in prose. If no tool fits, call verify_pan_depth with what you know.';
+
 const COST = {
   sam:   Number(process.env.COST_PER_SAM_CALL_USD   ?? 0.05),
   muse:  Number(process.env.COST_PER_MUSE_AUDIO_USD ?? 0.02),
@@ -429,6 +452,35 @@ function resolveTier(routeKey, headers, body) {
 }
 
 /**
+ * OpenAI tool_calls -> the linecheck `{tool:{name,arguments}}` shape.
+ *
+ * Deliberately conservative: if there is no tool call, or the body is not the shape we expect, the
+ * response is returned untouched so the client's own fallback (keyword match) still runs. A
+ * translation layer that guesses is worse than one that declines.
+ */
+function shapeSparkResponse(routeKey, payload, contentType) {
+  if (routeKey !== 'spark' || SPARK_PROTOCOL !== 'openai') return payload;
+  if (!String(contentType).includes('json')) return payload;
+  let parsed;
+  try { parsed = JSON.parse(payload); } catch { return payload; }
+
+  const call = parsed?.choices?.[0]?.message?.tool_calls?.[0];
+  if (!call?.function?.name) return payload;
+
+  let args = call.function.arguments;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+  return JSON.stringify({
+    tool: { name: call.function.name, arguments: args ?? {} },
+    confidence: null,
+    rationale: 'translated from openai tool_calls by the proxy',
+    upstream_model: parsed.model,
+    upstream_usage: parsed.usage,
+  });
+}
+
+/**
  * Stamp a JSON response with _meta so the HUD footer can show which route served it and what the
  * ledger has spent, without a second round trip to /__usage. Non-JSON bodies pass through
  * untouched - the same values ride on the response headers for those.
@@ -556,6 +608,25 @@ const server = createServer(async (req, res) => {
     } catch { /* not JSON: forward untouched */ }
   }
 
+  // ---- 0a2. translate the Spark request into the upstream's wire format ----
+  if (route.key === 'spark' && SPARK_PROTOCOL === 'openai' && ctype.includes('json') && raw.length) {
+    try {
+      const asked = JSON.parse(raw.toString('utf8'));
+      const tools = Array.isArray(asked.tools) ? asked.tools : [];
+      raw = Buffer.from(JSON.stringify({
+        model: SPARK_MODEL,
+        messages: [
+          { role: 'system', content: SPARK_SYSTEM },
+          { role: 'user', content: String(asked.transcript ?? '') },
+        ],
+        tools: tools.map((t) => ({ type: 'function', function: t })),
+        tool_choice: 'auto',
+        max_tokens: SPARK_MAX_TOKENS,
+      }), 'utf8');
+      log(`SPARK -> openai wire format (${tools.length} tools, model ${SPARK_MODEL})`);
+    } catch { /* not JSON: forward untouched */ }
+  }
+
   // ---- 0b. model tier (Spark only) ----
   let tier = null;
   let tierCfg = null;
@@ -679,7 +750,7 @@ const server = createServer(async (req, res) => {
       signal: controller.signal,
     });
 
-    const text = await upstream.text();
+    let text = await upstream.text();
     log(`#${ledger.paidCalls} <- ${upstream.status} (${text.length}B)`);
 
     if (upstream.status < 200 || upstream.status >= 300) {
@@ -730,6 +801,10 @@ const server = createServer(async (req, res) => {
     } else {
       log(`NO-RECONCILE ${url.pathname}: ${actual.basis} - keeping the $${nextCost.toFixed(2)} floor`);
     }
+
+    // translate the upstream's answer back into the contract the browser speaks, before it is
+    // cached, so a replay serves the same shape the live call did
+    text = shapeSparkResponse(route.key, text, upstream.headers.get('content-type') || 'application/json');
 
     const sampleWritten = await recordUsageSample(
       url.pathname, upstream.status, text, billingHeaders(upstream.headers), reconciliation,

@@ -320,6 +320,43 @@ Cost stays a flat per-call floor (`COST_PER_OPEN_WEIGHTS_CALL_USD`, default = th
 because the proxy never sees an invoice line; it reconciles against whatever the upstream
 reports and otherwise keeps the floor.
 
+### Live path - the real Meta Model API
+
+The browser only ever speaks one dialect: `{transcript, tools}` in, `{tool:{name,arguments}}` out.
+Meta Model API speaks OpenAI (`messages` + `tools` in, `choices[0].message.tool_calls[]` out), so the
+proxy translates. Nothing in the HUD changes when it goes live.
+
+| env | default | meaning |
+|---|---|---|
+| `PROXY_SPARK_PROTOCOL` | `linecheck` | `openai` switches the Spark route to the real wire format |
+| `META_MUSE_SPARK_URL` | - | `https://api.meta.ai/v1/chat/completions` |
+| `META_API_KEY` | - | your `MODEL_API_KEY` - server-side only, never `VITE_*` |
+| `META_SPARK_MODEL` | `muse-spark-1.3` | model id sent upstream |
+| `PROXY_SPARK_MAX_TOKENS` | `256` | `max_tokens` for the live call |
+| `PROXY_SPARK_SYSTEM` | tool-calling bias | system prompt; prose is unusable downstream |
+
+What it does, exactly:
+
+- **Request:** wraps the transcript in `[system, user]`, wraps each tool as
+  `{type:'function', function:…}`, sets `tool_choice:'auto'`, and substitutes the model id.
+- **Response:** reads `choices[0].message.tool_calls[0]`, JSON-parses `function.arguments`, and emits
+  the linecheck shape with `rationale` and `upstream_model` kept for the log. **If there is no tool
+  call, or the body is not that shape, it is returned untouched** - a translator that guesses is
+  worse than one that declines, and the client's own keyword fallback still runs.
+- Translation happens **before** the cache key is computed, so switching protocol invalidates the
+  replay cache instead of replaying a body shaped for the other dialect.
+
+Verified against a fake upstream that speaks the OpenAI wire format: the proxy sent `model=muse-spark-1.3`, `tool_choice=auto`, `messages=[system,user]`,
+`tools=[{type:function,…}]`; it returned
+`{"tool":{"name":"record_waste","arguments":{"ingredient":"Salmon Trim","weight_g":907,"reason":"Trim waste"}}}`,
+`_meta.actualCostUsd` reconciled to the upstream's `usage.total_cost_usd` ($0.00864 against a $0.03
+reserve), and the second identical call was a cache hit with the same shape.
+
+**Not wired: SAM 3.1 and Muse Voice Transcribe.** The real SAM contract is `POST /v1/responses` on
+model `sam-3.1` with one `input_text` noun phrase **per concept** plus one media part, streaming a
+special-token grammar (`<0f>` ordinal, box, mask) that needs `@meta-sam/parser` to decode into boxes
+and rasters. That is a different call, not a different shape, and it is the open work item.
+
 #### Tool schemas in the payload
 
 Spark needs the tool definitions to pick one. The HUD sends them, but a bare `curl` does not, so
@@ -390,3 +427,24 @@ recording cannot retrigger it.
 Both `S` and `V` are guarded by an in-flight flag plus a debounce, and the client adds its own
 `VITE_SNAPSHOT_MIN_INTERVAL_MS` floor - so neither can be driven from an animation frame even
 if the UI is changed to try.
+
+## Hackathon contributions (Oct 26 - Nov 4, 2026)
+
+Built during the Meta Global AI Developer Hackathon. LineCheck's proprietary kitchen-costing logic is
+**not** in this repository (`AGENTS.md` boundary); this harness is the demo surface around it.
+
+| what | state |
+|---|---|
+| 600x600 HUD, snapshot-only SAM path, coordinate contract with CI + in-browser self-tests | working |
+| Four WebMCP tools with real schemas, dispatch into HUD state, argument validation | working |
+| Voice chain: transcribe -> Spark -> tool call -> execution, one bounded capture per wake | working |
+| Server-side proxy: key isolation, spend ledger, replay cache, per-call reconciliation | working |
+| Model tiers (`primary` / `open-weights`) with tier-keyed cache and serve-time `_meta` | working |
+| Spark wire-protocol adapter for the real Meta Model API | built, verified against a fake upstream |
+| SAM 3.1 and Muse Voice Transcribe against the real API | **not wired** - mock contracts only |
+| Offline queue | **not built** |
+
+**Honesty note for judges:** the HUD, the tool chain and the budget machinery are real and run end
+to end; the three model endpoints behind the proxy are mock contracts that mirror the shapes we
+designed against. Every dollar figure shown is the proxy's simulation - actual spend on this build
+is $0.00. The Spark adapter is the one path that is ready for a live key.
