@@ -71,7 +71,15 @@ HF_SECRET = os.environ.get("FALLBACK_SECRET_NAME", "linecheck-fallback")
 vllm_image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
     .entrypoint([])
-    .uv_pip_install(f"vllm=={VLLM_VERSION}", "huggingface_hub[hf_transfer]")
+    # Pin the major of transformers: vLLM 0.8.5 declares `transformers>=4.51.1` with no upper
+    # bound, so a bare install resolved transformers 5.x - a major the release was never tested
+    # against, and the layer that owns the mllama vision tower. `hf_xet` replaces the removed
+    # `huggingface_hub[hf-transfer]` extra (installing it warned "no extra named hf-transfer").
+    .uv_pip_install(
+        f"vllm=={VLLM_VERSION}",
+        "transformers>=4.51.1,<5",
+        "hf_xet",
+    )
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
