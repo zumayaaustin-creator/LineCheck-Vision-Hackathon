@@ -27,15 +27,28 @@ The browser never learns the fallback exists: it calls one proxy path, and the p
 serving facts in `_meta` / `X-Model-Tier` / `X-Model-Id`, which the HUD footer already renders
 (`TIER:open-weights`, `MUSE:llama-3.2-11b-vision`).
 
-## Deploy (needs credentials - not yet done on this machine)
+## Deploy
+
+Weights: `meta-llama/Llama-3.2-11B-Vision-Instruct` is **gated** (`gated=manual`), so it needs licence
+acceptance on the HF account plus `HF_TOKEN` in the secret. `unsloth/Llama-3.2-11B-Vision-Instruct` is a
+**public mirror of the same weights** and needs no token at all - the first deploy used it, which is why
+no HF account was required. Point `FALLBACK_MODEL` at whichever you have access to.
 
 ```bash
 pip install modal
-modal setup                                              # browser login, once
-modal secret create linecheck-fallback \
-    FALLBACK_API_KEY=<random-long-string> HF_TOKEN=hf_... # Llama 3.2 Vision is a gated repo
-modal deploy fallback/modal_app.py
+modal setup                                   # browser login, once
+
+# keep the bearer token in a local dotenv outside the repo so it never reaches a command line
+#   ~/.linecheck/fallback.env  ->  FALLBACK_API_KEY=<random-long-string>
+#                                  HF_TOKEN=hf_...   (only for the gated meta-llama repo)
+modal secret create --from-dotenv ~/.linecheck/fallback.env linecheck-fallback --force
+
+# FALLBACK_MODEL is read at DEPLOY time, not request time: changing the model is a redeploy.
+FALLBACK_MODEL=unsloth/Llama-3.2-11B-Vision-Instruct modal deploy fallback/modal_app.py
 ```
+
+The app raises at startup if a gated model has no `HF_TOKEN`, rather than silently waiting out a
+download that can never succeed (`FALLBACK_REQUIRE_HF_TOKEN=true|false` overrides the heuristic).
 
 `modal deploy` prints the URL, e.g.
 
@@ -102,8 +115,9 @@ Measured on 2026-10-31 with fixtures 4 (not the real endpoint - no Modal credent
 
 ## Honest status and limits
 
-* **Not deployed.** No Modal token and no HF token exist on this machine, so `modal deploy` has not
-  run. Everything above is verified against local fakes of the same wire contract.
+* **Deployed on Modal** (`zumayaaustin` workspace) against the public mirror
+  `unsloth/Llama-3.2-11B-Vision-Instruct`; the live contract check is the acceptance test. Until that
+  passes, the honest status is "built and verified against fakes".
 * **No OpenAI `tool_calls` from this model.** Llama 3.2 Vision on vLLM does not emit tool calls, so
   the proxy sets a JSON-only instruction and parses the object out of the reply
   (`PROXY_FALLBACK_TOOL_JSON`, default on). If the model answers in prose the proxy declines to

@@ -55,6 +55,8 @@ import subprocess
 import modal
 
 APP_NAME = "linecheck-fallback"
+# `meta-llama/*` is gated (license acceptance + HF_TOKEN). `unsloth/Llama-3.2-11B-Vision-Instruct`
+# is a public mirror of the same weights and needs no token, which is what the first deploy used.
 MODEL_NAME = os.environ.get("FALLBACK_MODEL", "meta-llama/Llama-3.2-11B-Vision-Instruct")
 SERVED_MODEL_NAME = os.environ.get("FALLBACK_SERVED_MODEL_NAME", "llama-3.2-11b-vision")
 
@@ -112,10 +114,18 @@ def serve() -> None:
             f"FALLBACK_API_KEY is not set in the Modal secret '{HF_SECRET}'. "
             "The proxy sends it as a bearer token; without it this endpoint is open to the internet."
         )
-    if not os.environ.get("HF_TOKEN"):
+    # Only gated repos need a token: meta-llama/* requires license acceptance on the HF account.
+    # A public mirror of the same weights (unsloth/*) downloads without one, which is why the
+    # default deploy does not depend on an HF account existing. Override with
+    # FALLBACK_REQUIRE_HF_TOKEN=true|false when the heuristic is wrong.
+    require_hf = os.environ.get("FALLBACK_REQUIRE_HF_TOKEN")
+    if require_hf is None:
+        require_hf = "true" if MODEL_NAME.startswith("meta-llama/") else "false"
+    if require_hf.lower() == "true" and not os.environ.get("HF_TOKEN"):
         raise RuntimeError(
-            f"HF_TOKEN is not set in the Modal secret '{HF_SECRET}'. "
-            f"{MODEL_NAME} is a gated repository: the container cannot download the weights without it."
+            f"HF_TOKEN is not set in the Modal secret '{HF_SECRET}' and {MODEL_NAME} is gated. "
+            "Accept the licence on huggingface.co, then add HF_TOKEN to that secret - or point "
+            "FALLBACK_MODEL at a public mirror of the same weights."
         )
 
     cmd = [
