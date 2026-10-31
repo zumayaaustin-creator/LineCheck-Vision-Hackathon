@@ -352,10 +352,42 @@ Verified against a fake upstream that speaks the OpenAI wire format: the proxy s
 `_meta.actualCostUsd` reconciled to the upstream's `usage.total_cost_usd` ($0.00864 against a $0.03
 reserve), and the second identical call was a cache hit with the same shape.
 
-**Not wired: SAM 3.1 and Muse Voice Transcribe.** The real SAM contract is `POST /v1/responses` on
-model `sam-3.1` with one `input_text` noun phrase **per concept** plus one media part, streaming a
-special-token grammar (`<0f>` ordinal, box, mask) that needs `@meta-sam/parser` to decode into boxes
-and rasters. That is a different call, not a different shape, and it is the open work item.
+#### SAM 3.1 - the same trick, for a different call
+
+SAM is not a different *shape*, it is a different *call*: `POST /v1/responses`, model `sam-3.1`, one
+`input_text` **noun phrase per concept** plus one `input_image`, `stream: true`. The answer streams a
+special-token grammar in `output_text`:
+
+```
+text<0f>1<|box;x1=444;y1=600;x2=675;y2=849;w=1800;h=1200;c=0.93|><|mask;x=0;y=0;data=226,236,!...|>,2<|box;...|>
+```
+
+`PROXY_SAM_PROTOCOL=meta` makes the proxy build that request and read it back:
+
+| env | default | meaning |
+|---|---|---|
+| `PROXY_SAM_PROTOCOL` | `linecheck` | `meta` switches the SAM route to the Responses API |
+| `META_SAM_URL` | - | `https://api.meta.ai/v1/responses` |
+| `META_SAM_MODEL` | `sam-3.1` | model id |
+| `PROXY_SAM_CONCEPT` | `hotel pan` | the noun phrase to segment (one concept per call) |
+| `PROXY_SAM_INCLUDE_CONFIDENCE` | unset | ask for per-box `c=` confidence |
+
+**Only the box tokens are read.** The HUD needs boxes, not rasters, so the mask payloads are ignored
+entirely - no base85 decoding, no `@meta-sam/parser` dependency. Boxes carry the media's own `w`/`h`,
+so the adapter rescales them into the frame size the caller declared (a 1800x1200 answer to a
+1280x720 request comes back in 1280x720 space, and `x2`/`y2` are inclusive per the grammar). Zero
+matches is a successful empty result and returns `{detections: []}`.
+
+Verified against a fake streaming upstream: request carried `model=sam-3.1`, `stream=true`,
+`input=[{type:message, role:user, content:[input_text, input_image]}]`; 1800x1200 boxes arrived
+rescaled to 1280x720 (`x1=444 -> 316`, width `232 -> 165`), confidence 0.93 where present and 0.8
+where absent, a zero-match prompt returned an empty list, and `_meta` was stamped with
+`activeRoute: sam` and the `$0.05` reserve - which required relabelling the shaped body as
+`application/json` instead of passing the upstream's `text/event-stream` through.
+
+**Still not wired: Muse Voice Transcribe.** It is multipart with a `request` settings part plus the
+audio, close enough to our current body to be an adapter rather than a rewrite, but it has not been
+built.
 
 #### Tool schemas in the payload
 
@@ -441,7 +473,8 @@ Built during the Meta Global AI Developer Hackathon. LineCheck's proprietary kit
 | Server-side proxy: key isolation, spend ledger, replay cache, per-call reconciliation | working |
 | Model tiers (`primary` / `open-weights`) with tier-keyed cache and serve-time `_meta` | working |
 | Spark wire-protocol adapter for the real Meta Model API | built, verified against a fake upstream |
-| SAM 3.1 and Muse Voice Transcribe against the real API | **not wired** - mock contracts only |
+| SAM 3.1 adapter (Responses API, grammar -> boxes, concept prompt) | built, verified against a fake streaming upstream |
+| Muse Voice Transcribe against the real API | **not wired** - mock contract only |
 | Offline queue | **not built** |
 
 **Honesty note for judges:** the HUD, the tool chain and the budget machinery are real and run end

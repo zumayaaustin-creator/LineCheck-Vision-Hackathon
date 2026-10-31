@@ -119,6 +119,32 @@ const DEFAULT_TIER = 'primary';
  * switching protocol invalidates the cache instead of replaying a body shaped for the other one.
  */
 const SPARK_PROTOCOL = (process.env.PROXY_SPARK_PROTOCOL || 'linecheck').toLowerCase();
+
+// ---------------------------------------------------------------- SAM wire protocol
+/**
+ * SAM 3.1 on Meta Model API is a different call, not a different shape: POST /v1/responses with
+ * model `sam-3.1`, ONE noun-phrase concept per request, plus one media part. The answer streams a
+ * special-token grammar in `output_text` - one line per frame, each record an object id, a box and a
+ * mask:
+ *
+ *   text<0f>1<|box;x1=444;y1=625;x2=679;y2=850;w=1800;h=1200|><|mask;x=0;y=0;data=226,236,!...|>
+ *
+ * The HUD only needs boxes, so this adapter reads the box tokens and ignores the mask payloads
+ * entirely - no base85 decoding, no raster. Boxes are rescaled into the frame size the caller
+ * declared, because the response reports the media's own pixel size and the client normalises
+ * against what it sent.
+ *
+ *   PROXY_SAM_PROTOCOL              linecheck (default) | meta
+ *   META_SAM_MODEL                  default sam-3.1
+ *   PROXY_SAM_CONCEPT               the noun phrase to segment; default "hotel pan"
+ *   PROXY_SAM_INCLUDE_CONFIDENCE    asks the API for per-box confidence (adds `c=`)
+ *
+ * Zero matches is a valid answer and comes back as `{detections: []}` - the client renders nothing.
+ */
+const SAM_PROTOCOL = (process.env.PROXY_SAM_PROTOCOL || 'linecheck').toLowerCase();
+const SAM_MODEL = process.env.META_SAM_MODEL || 'sam-3.1';
+const SAM_CONCEPT = process.env.PROXY_SAM_CONCEPT || 'hotel pan';
+const SAM_INCLUDE_CONFIDENCE = process.env.PROXY_SAM_INCLUDE_CONFIDENCE === 'true';
 const SPARK_MODEL = process.env.META_SPARK_MODEL || 'muse-spark-1.3';
 const SPARK_MAX_TOKENS = Number(process.env.PROXY_SPARK_MAX_TOKENS ?? 256);
 const SPARK_SYSTEM =
@@ -481,6 +507,46 @@ function shapeSparkResponse(routeKey, payload, contentType) {
 }
 
 /**
+ * SAM grammar text -> `{detections:[...]}` in the frame space the caller declared.
+ *
+ * Reads box tokens only. A missing box token set is zero matches, which the API defines as a
+ * successful empty result, so it returns an empty list rather than an error.
+ */
+function shapeSamResponse(routeKey, payload, frame, concept) {
+  if (routeKey !== 'sam' || SAM_PROTOCOL !== 'meta') return payload;
+  const BOX = /<\|box;x1=(\d+);y1=(\d+);x2=(\d+);y2=(\d+);w=(\d+);h=(\d+)(?:;c=([0-9.]+))?\|>/g;
+  const detections = [];
+  let m;
+  let index = 0;
+  while ((m = BOX.exec(payload)) !== null) {
+    const [, x1, y1, x2, y2, w, h, c] = m;
+    const mediaW = Number(w) || 0;
+    const mediaH = Number(h) || 0;
+    const sx = frame?.width && mediaW ? frame.width / mediaW : 1;
+    const sy = frame?.height && mediaH ? frame.height / mediaH : 1;
+    index += 1;
+    detections.push({
+      id: `sam-${index}`,
+      label: String(concept || 'object').toUpperCase(),
+      x: Math.round(Number(x1) * sx),
+      y: Math.round(Number(y1) * sy),
+      // x2/y2 are inclusive per the API grammar
+      width: Math.round((Number(x2) - Number(x1) + 1) * sx),
+      height: Math.round((Number(y2) - Number(y1) + 1) * sy),
+      confidence: c ? Number(c) : 0.8,
+      status: 'nominal',
+    });
+  }
+  return JSON.stringify({
+    detections,
+    model: SAM_MODEL,
+    concept: String(concept || ''),
+    matches: detections.length,
+    note: 'boxes parsed from the SAM grammar; masks not decoded by this proxy',
+  });
+}
+
+/**
  * Stamp a JSON response with _meta so the HUD footer can show which route served it and what the
  * ledger has spent, without a second round trip to /__usage. Non-JSON bodies pass through
  * untouched - the same values ride on the response headers for those.
@@ -627,6 +693,28 @@ const server = createServer(async (req, res) => {
     } catch { /* not JSON: forward untouched */ }
   }
 
+  // ---- 0a3. translate the SAM request into the Responses API ----
+  let samFrame = null;
+  if (route.key === 'sam' && SAM_PROTOCOL === 'meta' && ctype.includes('json') && raw.length) {
+    try {
+      const asked = JSON.parse(raw.toString('utf8'));
+      samFrame = { width: Number(asked.width) || 0, height: Number(asked.height) || 0 };
+      raw = Buffer.from(JSON.stringify({
+        model: SAM_MODEL,
+        input: [{
+          type: 'message', role: 'user',
+          content: [
+            { type: 'input_text', text: String(asked.concept || SAM_CONCEPT) },
+            { type: 'input_image', image_url: String(asked.frame || '') },
+          ],
+        }],
+        stream: true,
+        ...(SAM_INCLUDE_CONFIDENCE ? { include_confidence: true } : {}),
+      }), 'utf8');
+      log(`SAM -> responses wire format (concept "${asked.concept || SAM_CONCEPT}", model ${SAM_MODEL})`);
+    } catch { /* not JSON: forward untouched */ }
+  }
+
   // ---- 0b. model tier (Spark only) ----
   let tier = null;
   let tierCfg = null;
@@ -751,6 +839,7 @@ const server = createServer(async (req, res) => {
     });
 
     let text = await upstream.text();
+    let upstreamCtype = upstream.headers.get('content-type') || 'application/json';
     log(`#${ledger.paidCalls} <- ${upstream.status} (${text.length}B)`);
 
     if (upstream.status < 200 || upstream.status >= 300) {
@@ -804,7 +893,10 @@ const server = createServer(async (req, res) => {
 
     // translate the upstream's answer back into the contract the browser speaks, before it is
     // cached, so a replay serves the same shape the live call did
-    text = shapeSparkResponse(route.key, text, upstream.headers.get('content-type') || 'application/json');
+    text = shapeSparkResponse(route.key, text, upstreamCtype);
+    text = shapeSamResponse(route.key, text, samFrame, SAM_CONCEPT);
+    // both adapters emit JSON; an SSE content-type would be a lie downstream and would skip _meta
+    if (!upstreamCtype.includes('json') && text.trimStart().startsWith('{')) upstreamCtype = 'application/json';
 
     const sampleWritten = await recordUsageSample(
       url.pathname, upstream.status, text, billingHeaders(upstream.headers), reconciliation,
@@ -816,14 +908,14 @@ const server = createServer(async (req, res) => {
       hash,
       route: url.pathname,
       status: upstream.status,
-      contentType: upstream.headers.get('content-type') || 'application/json',
+      contentType: upstreamCtype,
       body: text,
       costUsd: nextCost,
       recordedAtUtc: new Date().toISOString(),
       upstream: upstreamUrl.replace(/\/\/.*@/, '//'),
     });
 
-    const servedBody = stampMeta(text, upstream.headers.get('content-type') || 'application/json', {
+    const servedBody = stampMeta(text, upstreamCtype, {
       activeRoute: route.key,
       modelTier: tier,
       modelId: activeModelId,
@@ -836,7 +928,7 @@ const server = createServer(async (req, res) => {
     });
 
     res.writeHead(upstream.status, {
-      'Content-Type': upstream.headers.get('content-type') || 'application/json',
+      'Content-Type': upstreamCtype,
       'Content-Length': Buffer.byteLength(servedBody),
       'X-Proxy-Cost': nextCost.toFixed(3),
       'X-Proxy-Cost-Actual': reconciliation.actualUsd === null ? 'unknown' : String(reconciliation.actualUsd),
