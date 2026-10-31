@@ -62,3 +62,7 @@ desktop.ini
 *.bak
 scratch/
 tmp/
+
+# python artifacts (fallback/ is a python app inside a JS repo)
+__pycache__/
+*.pyc
