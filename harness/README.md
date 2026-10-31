@@ -8,6 +8,15 @@ No dependencies. Node's built-in `http` only.
 
 ---
 
+## Fallback route (open-weight Meta vision, Modal)
+
+`harness/proxy-server.mjs` can fail over from the primary Meta route to an open-weight tier when the
+primary errors. The served endpoint lives in `fallback/` (Modal + vLLM, Llama 3.2 Vision, OpenAI
+wire format). Switch it on with `FALLBACK_MODE=auto`; see `fallback/README.md` for the deploy, the
+exact trigger rules, and how to rehearse the whole thing offline with `fallback/dev-fixtures.mjs`.
+
+---
+
 ## Run the mock server
 
 ```bash

@@ -40,8 +40,12 @@ Before claiming a change works, run:
 ```bash
 cd harness/webmcp
 npx tsc --noEmit      # types
-npm test              # 13 coordinate-contract assertions
+npm test              # 50 assertions: coordinates, wake word, tiers, tool dispatch
 npm run build         # production bundle
+
+# from the repo root - the fallback route and its switch
+node fallback/contract.mjs --self-test        # OpenAI-compatible contract checker
+node --test harness/tests/proxy-fallback.test.mjs   # 9 failover cases, real proxy + real ledger
 ```
 
 Then exercise it in a browser. A green build is not evidence the HUD renders correctly: several
@@ -56,7 +60,9 @@ a random multipart boundary.
 |---|---|
 | `harness/webmcp/` | the app: canvas loop, HUDStore, Meta client, normaliser, tools, mic |
 | `harness/mock-server.mjs` | local SAM 3.1 + Muse contracts, zero dependencies |
-| `harness/proxy-server.mjs` | server-side key proxy with a hard call ceiling |
+| `harness/proxy-server.mjs` | server-side key proxy with a hard call ceiling and primary->open-weights failover |
+| `fallback/` | Modal app serving Llama 3.2 Vision as an OpenAI-compatible endpoint, plus its contract checker and rehearsal fixtures |
+| `harness/tests/proxy-fallback.test.mjs` | the 9-case failover suite (refunds, triggers, breaker, budget gates) |
 | `harness/sam-3.1/`, `harness/muse-audio/` | contract fixtures |
 | `specs/architecture/System-Spec.md` | pipeline, invariants, coordinate contract |
 | `sprints/Sprint-01.md` | budget allocation and deliverable status |
@@ -68,3 +74,8 @@ throttling, local mock contracts, key proxy with ceiling, microphone capture wit
 
 Not working yet: live Meta calls (the live branch has only ever spoken to the local mock), wake
 word, real camera frames.
+
+Fallback route (`fallback/`): built and verified against local fakes of the same wire contract -
+contract checker, 9 proxy failover cases, and a browser run that shows `TIER:open-weights` in the
+footer. **Not deployed**: no Modal or Hugging Face token exists on this machine yet, so
+`modal deploy` has never run.

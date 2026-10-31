@@ -120,6 +120,131 @@ const DEFAULT_TIER = 'primary';
  */
 const SPARK_PROTOCOL = (process.env.PROXY_SPARK_PROTOCOL || 'linecheck').toLowerCase();
 
+// ---------------------------------------------------------------- failover: primary -> open-weights
+/**
+ * "Seamless switch when the primary Meta API fails" is a routing decision, so it lives here and not
+ * in the browser: the HUD cannot know that Spark timed out, and teaching it a second retry loop
+ * would put the second endpoint's URL in the bundle.
+ *
+ *   FALLBACK_MODE        off (default) | auto
+ *   FALLBACK_TIER        which tier serves as the fallback        (default open-weights)
+ *   FALLBACK_TRIGGERS    status,timeout,network                   (default all three)
+ *   FALLBACK_COOLDOWN_MS how long to bypass a failing primary     (default 60000)
+ *   PROXY_FALLBACK_TOOL_JSON  true (default) | false  - parse a JSON tool reply out of a model that
+ *                             has no OpenAI tool_calls support (vLLM + Llama 3.2 Vision)
+ *
+ * Deliberate choices:
+ *  - `off` by default. A silent switch that the ledger cannot explain is worse than a visible error,
+ *    and the demo needs to be able to show the primary path failing honestly.
+ *  - An explicit `x-model-tier: open-weights` request never touches the primary, and never gets
+ *    relabelled; only a request that ASKED for primary can be served by the fallback.
+ *  - Our own budget refusals (429 from this proxy) never trigger failover. Failing over past our own
+ *    ceiling would be spending money the operator just refused to spend.
+ *  - A 4xx from the primary is not a fallback trigger: a malformed request will be malformed
+ *    everywhere, and retrying it doubles the bill for the same error.
+ *  - The fallback attempt re-runs the budget gates and re-reserves, so the ledger records two
+ *    reservations and one refund - the refunded primary attempt is visible instead of vanishing.
+ */
+const FALLBACK_MODE = (process.env.FALLBACK_MODE || 'off').toLowerCase();
+const FALLBACK_TIER = process.env.FALLBACK_TIER || 'open-weights';
+const FALLBACK_COOLDOWN_MS = Number(process.env.FALLBACK_COOLDOWN_MS ?? 60000);
+const FALLBACK_TRIGGERS = new Set(
+  (process.env.FALLBACK_TRIGGERS || 'status,timeout,network')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
+const FALLBACK_TOOL_JSON = String(process.env.PROXY_FALLBACK_TOOL_JSON ?? 'true') !== 'false';
+
+/** When the primary is known-bad, skip straight to the fallback tier until this timestamp. */
+let primaryDownUntil = 0;
+
+const FALLBACK_STATUSES = new Set([408, 409, 429, 500, 502, 503, 504]);
+
+/**
+ * The ordered list of upstreams a request may touch.
+ * A single entry unless: Spark route, caller asked for primary, mode is auto, the fallback tier is
+ * configured, and it is not the same tier as the primary.
+ */
+function buildAttemptPlan(requestedTier, routeKey = 'spark') {
+  const solo = [{ tier: requestedTier, via: null }];
+  if (routeKey !== 'spark' || requestedTier !== DEFAULT_TIER) return solo;
+  if (FALLBACK_MODE !== 'auto') return solo;
+  const fb = MODEL_TIERS[FALLBACK_TIER];
+  if (!fb || FALLBACK_TIER === requestedTier || !fb.url()) return solo;
+  if (Date.now() < primaryDownUntil) {
+    return [{ tier: FALLBACK_TIER, via: 'circuit_open' }];
+  }
+  return [{ tier: requestedTier, via: null }, { tier: FALLBACK_TIER, via: 'failover' }];
+}
+
+/** Does this failure justify spending on a second attempt? */
+function isFailoverWorthy(failure) {
+  if (!failure) return false;
+  if (failure.kind === 'timeout') return FALLBACK_TRIGGERS.has('timeout');
+  if (failure.kind === 'network') return FALLBACK_TRIGGERS.has('network');
+  if (failure.kind === 'status') return FALLBACK_TRIGGERS.has('status') && FALLBACK_STATUSES.has(failure.status);
+  return false;
+}
+
+/**
+ * Pull the first balanced JSON object out of prose. vLLM + Llama 3.2 Vision has no OpenAI tool_call
+ * support, so the fallback is asked to answer with the contract object; this reads it back.
+ * Declines (returns null) rather than guessing - the client's own keyword fallback still runs.
+ */
+function firstJsonObject(text) {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+/** OpenAI chat body -> linecheck `{tool:{name,arguments}}` when the model replied with JSON text. */
+function shapeFallbackToolJson(routeKey, payload, contentType, enabled = FALLBACK_TOOL_JSON) {
+  if (!enabled || routeKey !== 'spark') return payload;
+  if (!String(contentType).includes('json')) return payload;
+  let parsed;
+  try { parsed = JSON.parse(payload); } catch { return payload; }
+  const msg = parsed?.choices?.[0]?.message;
+  if (!msg || (Array.isArray(msg.tool_calls) && msg.tool_calls.length)) return payload;
+  const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+  if (!content) return payload;
+
+  const candidate = firstJsonObject(content);
+  if (!candidate || typeof candidate !== 'object') return payload;
+  const tool = candidate.tool && typeof candidate.tool === 'object' && candidate.tool.name
+    ? candidate.tool
+    : (typeof candidate.name === 'string'
+      ? { name: candidate.name, arguments: candidate.arguments ?? {} }
+      : null);
+  if (!tool?.name) return payload;
+
+  return JSON.stringify({
+    tool: { name: tool.name, arguments: tool.arguments ?? {} },
+    confidence: typeof candidate.confidence === 'number' ? candidate.confidence : null,
+    rationale: "translated from the fallback model's JSON reply by the proxy",
+    upstream_model: parsed.model,
+    upstream_usage: parsed.usage,
+  });
+}
+
 // ---------------------------------------------------------------- SAM wire protocol
 /**
  * SAM 3.1 on Meta Model API is a different call, not a different shape: POST /v1/responses with
@@ -740,221 +865,292 @@ const server = createServer(async (req, res) => {
     tierCfg = MODEL_TIERS[tier];
   }
 
-  const activeUpstream = tierCfg ? tierCfg.url() : route.upstream;
-  const activeKey = tierCfg ? tierCfg.key() : API_KEY;
-  const activeModelId = tierCfg ? tierCfg.id : 'n/a';
+  // ---- 0c. which upstreams this request may touch, in order ----
+  const plan = buildAttemptPlan(tier, route.key);
+  if (plan.length > 1) log(`PLAN ${url.pathname} -> ${plan.map((a) => a.tier || 'route').join(' then ')}`);
+  let lastFailure = null;
 
-  // the tier is part of the key: a primary answer must never be replayed for an open-weight ask
-  const hash = cacheKeyFor(tier ? `${route.key}:${tier}` : route.key, ctype, raw);
-  const nextCost = tierCfg ? tierCfg.cost() : route.cost;
+  for (let attemptIndex = 0; attemptIndex < plan.length; attemptIndex += 1) {
+    const attempt = plan[attemptIndex];
+    const isLastAttempt = attemptIndex === plan.length - 1;
+    const cfg = attempt.tier ? MODEL_TIERS[attempt.tier] : null;
+    const activeUpstream = cfg ? cfg.url() : route.upstream;
+    const activeKey = cfg ? cfg.key() : API_KEY;
+    const activeModelId = cfg ? cfg.id : 'n/a';
+    const nextCost = cfg ? cfg.cost() : route.cost;
+    const attemptTier = attempt.tier;
 
-  // ---- 1. replay cache: a hit costs nothing and never touches upstream ----
-  const cached = await readCache(hash);
-  if (cached && CACHE_MODE === 'record-or-replay') {
-    ledger.cacheHits += 1;
+    // the tier is part of the key: a primary answer must never be replayed for an open-weight ask
+    const hash = cacheKeyFor(attemptTier ? `${route.key}:${attemptTier}` : route.key, ctype, raw);
+
+    // ---- 1. replay cache: a hit costs nothing and never touches upstream ----
+    const cached = await readCache(hash);
+    if (cached && CACHE_MODE === 'record-or-replay') {
+      ledger.cacheHits += 1;
+      saveLedger();
+      log(`CACHE HIT ${url.pathname} ${hash.slice(0, 12)} -> $0.00 (${ledger.cacheHits} hits)`);
+      const hitBody = stampMeta(cached.body, cached.contentType || 'application/json', {
+        activeRoute: route.key,
+        modelTier: attemptTier,
+        modelId: activeModelId,
+        cached: true,
+        costUsd: 0,
+        ledgerSpentUsd: round6(ledger.totalSpendUsd),
+        sessionSpendUsd: round6(sessionSpendUsd),
+        cacheHits: ledger.cacheHits,
+        ...(attempt.via ? { fallback: { to: attemptTier, reason: attempt.via, servedFromCache: true } } : {}),
+      });
+      res.writeHead(cached.status ?? 200, {
+        'Content-Type': cached.contentType || 'application/json',
+        'Content-Length': Buffer.byteLength(hitBody),
+        'X-Proxy-Cache': 'hit',
+        'X-Model-Tier': attemptTier || 'n/a',
+        'X-Model-Id': activeModelId,
+        'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
+        ...(attempt.via ? { 'X-Fallback': `${DEFAULT_TIER}->${attemptTier}`, 'X-Fallback-Reason': attempt.via } : {}),
+        ...corsFor(req),
+      });
+      res.end(hitBody);
+      return;
+    }
+
+    // ---- 2. budget gates, all checked before any upstream call ----
+    const wouldTotal = ledger.totalSpendUsd + nextCost;
+    const wouldSession = sessionSpendUsd + nextCost;
+
+    if (ledger.paidCalls >= MAX_PAID_CALLS) {
+      log(`REFUSED ${url.pathname}: call cap ${MAX_PAID_CALLS}`);
+      json(req, res, 429, {
+        error: 'call_cap_reached',
+        message: `Refusing: ${MAX_PAID_CALLS} paid calls already made.`,
+        paidCalls: ledger.paidCalls, maxPaidCalls: MAX_PAID_CALLS,
+      });
+      return;
+    }
+    if (wouldTotal > MAX_SPEND_USD) {
+      log(`REFUSED ${url.pathname}: lifetime budget would exceed $${MAX_SPEND_USD} ($${ledger.totalSpendUsd.toFixed(4)} + $${nextCost})`);
+      json(req, res, 429, {
+        error: 'budget_exceeded',
+        message: `Refusing: next call costs $${nextCost}, which would put lifetime spend at $${round6(wouldTotal)} against a $${MAX_SPEND_USD} ceiling.`,
+        totalSpendUsd: round6(ledger.totalSpendUsd),
+        remainingUsd: round6(Math.max(0, MAX_SPEND_USD - ledger.totalSpendUsd)),
+        nextCallCostUsd: nextCost,
+      });
+      return;
+    }
+    if (wouldSession > MAX_SESSION_SPEND_USD) {
+      log(`REFUSED ${url.pathname}: session budget would exceed $${MAX_SESSION_SPEND_USD}`);
+      json(req, res, 429, {
+        error: 'session_budget_exceeded',
+        message: `Refusing: next call costs $${nextCost}, which would put this session at $${round6(wouldSession)} against a $${MAX_SESSION_SPEND_USD} ceiling.`,
+        sessionSpendUsd: round6(sessionSpendUsd),
+        sessionRemainingUsd: round6(Math.max(0, MAX_SESSION_SPEND_USD - sessionSpendUsd)),
+        nextCallCostUsd: nextCost,
+      });
+      return;
+    }
+
+    // ---- 3. reserve the cost BEFORE the call so a crash still counts ----
+    ledger.paidCalls += 1;
+    ledger.totalSpendUsd = round6(ledger.totalSpendUsd + nextCost);
+    sessionSpendUsd = round6(sessionSpendUsd + nextCost);
+    ledger.byRoute[route.key].calls += 1;
+    ledger.byRoute[route.key].spendUsd = round6(ledger.byRoute[route.key].spendUsd + nextCost);
     saveLedger();
-    log(`CACHE HIT ${url.pathname} ${hash.slice(0, 12)} -> $0.00 (${ledger.cacheHits} hits)`);
-    const hitBody = stampMeta(cached.body, cached.contentType || 'application/json', {
-      activeRoute: route.key,
-      modelTier: tier,
-      modelId: activeModelId,
-      cached: true,
-      costUsd: 0,
-      ledgerSpentUsd: round6(ledger.totalSpendUsd),
-      sessionSpendUsd: round6(sessionSpendUsd),
-      cacheHits: ledger.cacheHits,
-    });
-    res.writeHead(cached.status ?? 200, {
-      'Content-Type': cached.contentType || 'application/json',
-      'Content-Length': Buffer.byteLength(hitBody),
-      'X-Proxy-Cache': 'hit',
-      'X-Model-Tier': tier || 'n/a',
-      'X-Model-Id': activeModelId,
-      'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
-      ...corsFor(req),
-    });
-    res.end(hitBody);
-    return;
-  }
 
-  // ---- 2. budget gates, all checked before any upstream call ----
-  const wouldTotal = ledger.totalSpendUsd + nextCost;
-  const wouldSession = sessionSpendUsd + nextCost;
+    log(`#${ledger.paidCalls} ${url.pathname}${attemptTier ? ` [${attemptTier}]` : ''} $${nextCost.toFixed(2)} (lifetime $${ledger.totalSpendUsd.toFixed(2)}/${MAX_SPEND_USD}, session $${sessionSpendUsd.toFixed(2)}/${MAX_SESSION_SPEND_USD})`);
 
-  if (ledger.paidCalls >= MAX_PAID_CALLS) {
-    log(`REFUSED ${url.pathname}: call cap ${MAX_PAID_CALLS}`);
-    json(req, res, 429, {
-      error: 'call_cap_reached',
-      message: `Refusing: ${MAX_PAID_CALLS} paid calls already made.`,
-      paidCalls: ledger.paidCalls, maxPaidCalls: MAX_PAID_CALLS,
-    });
-    return;
-  }
-  if (wouldTotal > MAX_SPEND_USD) {
-    log(`REFUSED ${url.pathname}: lifetime budget would exceed $${MAX_SPEND_USD} ($${ledger.totalSpendUsd.toFixed(4)} + $${nextCost})`);
-    json(req, res, 429, {
-      error: 'budget_exceeded',
-      message: `Refusing: next call costs $${nextCost}, which would put lifetime spend at $${round6(wouldTotal)} against a $${MAX_SPEND_USD} ceiling.`,
-      totalSpendUsd: round6(ledger.totalSpendUsd),
-      remainingUsd: round6(Math.max(0, MAX_SPEND_USD - ledger.totalSpendUsd)),
-      nextCallCostUsd: nextCost,
-    });
-    return;
-  }
-  if (wouldSession > MAX_SESSION_SPEND_USD) {
-    log(`REFUSED ${url.pathname}: session budget would exceed $${MAX_SESSION_SPEND_USD}`);
-    json(req, res, 429, {
-      error: 'session_budget_exceeded',
-      message: `Refusing: next call costs $${nextCost}, which would put this session at $${round6(wouldSession)} against a $${MAX_SESSION_SPEND_USD} ceiling.`,
-      sessionSpendUsd: round6(sessionSpendUsd),
-      sessionRemainingUsd: round6(Math.max(0, MAX_SESSION_SPEND_USD - sessionSpendUsd)),
-      nextCallCostUsd: nextCost,
-    });
-    return;
-  }
+    const upstreamUrl = activeUpstream + (url.search || '');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Number(process.env.PROXY_TIMEOUT_MS || 30000));
 
-  // ---- 3. reserve the cost BEFORE the call so a crash still counts ----
-  ledger.paidCalls += 1;
-  ledger.totalSpendUsd = round6(ledger.totalSpendUsd + nextCost);
-  sessionSpendUsd = round6(sessionSpendUsd + nextCost);
-  ledger.byRoute[route.key].calls += 1;
-  ledger.byRoute[route.key].spendUsd = round6(ledger.byRoute[route.key].spendUsd + nextCost);
-  saveLedger();
-
-  log(`#${ledger.paidCalls} ${url.pathname}${tier ? ` [${tier}]` : ''} $${nextCost.toFixed(2)} (lifetime $${ledger.totalSpendUsd.toFixed(2)}/${MAX_SPEND_USD}, session $${sessionSpendUsd.toFixed(2)}/${MAX_SESSION_SPEND_USD})`);
-
-  const upstreamUrl = activeUpstream + (url.search || '');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Number(process.env.PROXY_TIMEOUT_MS || 30000));
-
-  try {
-    const upstream = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${activeKey}`, // credential never leaves the server
-        ...(ctype.includes('multipart') ? {} : { 'Content-Type': ctype || 'application/json' }),
-      },
-      body: raw.length ? raw : undefined,
-      signal: controller.signal,
-    });
-
-    let text = await upstream.text();
-    let upstreamCtype = upstream.headers.get('content-type') || 'application/json';
-    log(`#${ledger.paidCalls} <- ${upstream.status} (${text.length}B)`);
-
-    if (upstream.status < 200 || upstream.status >= 300) {
-      // refund: an outright rejection was almost certainly not billed
+    /** refund the reservation for a failed attempt; returns nothing, mutates the ledger */
+    const refundAttempt = (why) => {
       ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd - nextCost));
       sessionSpendUsd = round6(Math.max(0, sessionSpendUsd - nextCost));
       ledger.byRoute[route.key].spendUsd = round6(Math.max(0, ledger.byRoute[route.key].spendUsd - nextCost));
       ledger.refundedUsd = round6(ledger.refundedUsd + nextCost);
       ledger.failedCalls += 1;
       saveLedger();
-      log(`REFUND ${url.pathname} $${nextCost.toFixed(2)} (upstream ${upstream.status}) -> lifetime $${ledger.totalSpendUsd.toFixed(2)}`);
-
-      res.writeHead(upstream.status, {
-        'Content-Type': upstream.headers.get('content-type') || 'application/json',
-        'Content-Length': Buffer.byteLength(text),
-        'X-Proxy-Cost': 'refunded',
-        ...corsFor(req),
-      });
-      res.end(text);
-      return;
-    }
-
-    // ---- reconcile the reserved floor against what the upstream actually reported ----
-    const usage = extractUsage(text);
-    const actual = actualCostFrom(usage);
-    let reconciliation = {
-      reservedUsd: nextCost,
-      actualUsd: null,
-      deltaUsd: 0,
-      basis: actual.basis,
+      log(`REFUND ${url.pathname}${attemptTier ? ` [${attemptTier}]` : ''} $${nextCost.toFixed(2)} (${why}) -> lifetime $${ledger.totalSpendUsd.toFixed(2)}`);
     };
 
-    if (actual.usd !== null) {
-      const delta = round6(actual.usd - nextCost);
-      ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd + delta));
-      sessionSpendUsd = round6(Math.max(0, sessionSpendUsd + delta));
-      ledger.byRoute[route.key].spendUsd = round6(Math.max(0, ledger.byRoute[route.key].spendUsd + delta));
-      ledger.reconciledUsd = round6(ledger.reconciledUsd + delta);
-      ledger.reconciledCalls += 1;
-      reconciliation = { reservedUsd: nextCost, actualUsd: actual.usd, deltaUsd: delta, basis: actual.basis };
-      saveLedger();
-
-      const sign = delta >= 0 ? '+' : '-';
-      log(`RECONCILE ${url.pathname} reserved $${nextCost.toFixed(4)} -> actual $${actual.usd.toFixed(6)} (${sign}$${Math.abs(delta).toFixed(6)}) [${actual.basis}] lifetime $${ledger.totalSpendUsd.toFixed(4)}`);
-      if (ledger.totalSpendUsd > MAX_SPEND_USD) {
-        log(`WARN: reconciliation pushed lifetime spend to $${ledger.totalSpendUsd.toFixed(4)}, above the $${MAX_SPEND_USD} ceiling - it was already spent`);
+    /** decide once per failed attempt: fall over, or answer with the failure */
+    const handleFailure = (failure) => {
+      lastFailure = failure;
+      const canFailOver = !isLastAttempt && isFailoverWorthy(failure);
+      if (canFailOver) {
+        primaryDownUntil = Date.now() + FALLBACK_COOLDOWN_MS;
+        log(`FAILOVER ${url.pathname}: ${failure.kind}${failure.status ? ` ${failure.status}` : ''} -> ${plan[attemptIndex + 1].tier} (primary bypassed for ${FALLBACK_COOLDOWN_MS}ms)`);
+        return 'continue';
       }
-    } else {
-      log(`NO-RECONCILE ${url.pathname}: ${actual.basis} - keeping the $${nextCost.toFixed(2)} floor`);
+      const status = failure.kind === 'timeout' ? 504 : failure.kind === 'network' ? 502 : failure.status;
+      const headers = {
+        'Content-Type': failure.contentType || 'application/json',
+        'Content-Length': Buffer.byteLength(failure.body ?? ''),
+        'X-Proxy-Cost': 'refunded',
+        ...(plan.length > 1 ? { 'X-Fallback': 'attempted-and-failed' } : {}),
+        ...corsFor(req),
+      };
+      if (failure.kind === 'status') {
+        res.writeHead(status, headers);
+        res.end(failure.body ?? '');
+        return 'responded';
+      }
+      const payload = JSON.stringify({
+        error: failure.kind === 'timeout' ? 'upstream_timeout' : 'upstream_unreachable',
+        message: String(failure.message ?? failure.kind),
+        ...(plan.length > 1 ? { fallback: { attempted: true, failed: true, reasons: [failure.kind] } } : {}),
+      }, null, 2);
+      res.writeHead(status, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'X-Proxy-Cost': 'refunded',
+        ...(plan.length > 1 ? { 'X-Fallback': 'attempted-and-failed' } : {}),
+        ...corsFor(req),
+      });
+      res.end(payload);
+      return 'responded';
+    };
+
+    try {
+      const upstream = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeKey}`, // credential never leaves the server
+          ...(ctype.includes('multipart') ? {} : { 'Content-Type': ctype || 'application/json' }),
+        },
+        body: raw.length ? raw : undefined,
+        signal: controller.signal,
+      });
+
+      let text = await upstream.text();
+      let upstreamCtype = upstream.headers.get('content-type') || 'application/json';
+      log(`#${ledger.paidCalls} <- ${upstream.status} (${text.length}B)`);
+
+      if (upstream.status < 200 || upstream.status >= 300) {
+        // refund: an outright rejection was almost certainly not billed
+        refundAttempt(`upstream ${upstream.status}`);
+        const outcome = handleFailure({
+          kind: 'status', status: upstream.status, body: text, contentType: upstream.headers.get('content-type') || 'application/json',
+        });
+        if (outcome === 'continue') { clearTimeout(timer); continue; }
+        clearTimeout(timer);
+        return;
+      }
+
+      // ---- reconcile the reserved floor against what the upstream actually reported ----
+      const usage = extractUsage(text);
+      const actual = actualCostFrom(usage);
+      let reconciliation = {
+        reservedUsd: nextCost,
+        actualUsd: null,
+        deltaUsd: 0,
+        basis: actual.basis,
+      };
+
+      if (actual.usd !== null) {
+        const delta = round6(actual.usd - nextCost);
+        ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd + delta));
+        sessionSpendUsd = round6(Math.max(0, sessionSpendUsd + delta));
+        ledger.byRoute[route.key].spendUsd = round6(Math.max(0, ledger.byRoute[route.key].spendUsd + delta));
+        ledger.reconciledUsd = round6(ledger.reconciledUsd + delta);
+        ledger.reconciledCalls += 1;
+        reconciliation = { reservedUsd: nextCost, actualUsd: actual.usd, deltaUsd: delta, basis: actual.basis };
+        saveLedger();
+
+        const sign = delta >= 0 ? '+' : '-';
+        log(`RECONCILE ${url.pathname} reserved $${nextCost.toFixed(4)} -> actual $${actual.usd.toFixed(6)} (${sign}$${Math.abs(delta).toFixed(6)}) [${actual.basis}] lifetime $${ledger.totalSpendUsd.toFixed(4)}`);
+        if (ledger.totalSpendUsd > MAX_SPEND_USD) {
+          log(`WARN: reconciliation pushed lifetime spend to $${ledger.totalSpendUsd.toFixed(4)}, above the $${MAX_SPEND_USD} ceiling - it was already spent`);
+        }
+      } else {
+        log(`NO-RECONCILE ${url.pathname}: ${actual.basis} - keeping the $${nextCost.toFixed(2)} floor`);
+      }
+
+      // translate the upstream's answer back into the contract the browser speaks, before it is
+      // cached, so a replay serves the same shape the live call did
+      text = shapeSparkResponse(route.key, text, upstreamCtype);
+      text = shapeFallbackToolJson(route.key, text, upstreamCtype);
+      text = shapeSamResponse(route.key, text, samFrame, SAM_CONCEPT);
+      // both adapters emit JSON; an SSE content-type would be a lie downstream and would skip _meta
+      if (!upstreamCtype.includes('json') && text.trimStart().startsWith('{')) upstreamCtype = 'application/json';
+
+      const sampleWritten = await recordUsageSample(
+        url.pathname, upstream.status, text, billingHeaders(upstream.headers), reconciliation,
+      );
+      if (sampleWritten) log(`SAMPLE ${url.pathname} -> ${USAGE_SAMPLE_PATH}`);
+
+      // only successful responses are worth replaying
+      await writeCache(hash, {
+        hash,
+        route: url.pathname,
+        status: upstream.status,
+        contentType: upstreamCtype,
+        body: text,
+        costUsd: nextCost,
+        recordedAtUtc: new Date().toISOString(),
+        upstream: upstreamUrl.replace(/\/\/.*@/, '//'),
+      });
+
+      const servedBody = stampMeta(text, upstreamCtype, {
+        activeRoute: route.key,
+        modelTier: attemptTier,
+        modelId: activeModelId,
+        cached: false,
+        costUsd: nextCost,
+        actualCostUsd: reconciliation.actualUsd,
+        ledgerSpentUsd: round6(ledger.totalSpendUsd),
+        sessionSpendUsd: round6(sessionSpendUsd),
+        cacheHits: ledger.cacheHits,
+        ...(attempt.via
+          ? {
+            fallback: {
+              from: DEFAULT_TIER,
+              to: attemptTier,
+              reason: attempt.via,
+              primaryFailure: lastFailure
+                ? { kind: lastFailure.kind, status: lastFailure.status ?? null }
+                : null,
+            },
+          }
+          : {}),
+      });
+
+      res.writeHead(upstream.status, {
+        'Content-Type': upstreamCtype,
+        'Content-Length': Buffer.byteLength(servedBody),
+        'X-Proxy-Cost': nextCost.toFixed(3),
+        'X-Proxy-Cost-Actual': reconciliation.actualUsd === null ? 'unknown' : String(reconciliation.actualUsd),
+        'X-Proxy-Cache': 'miss',
+        'X-Model-Tier': attemptTier || 'n/a',
+        'X-Model-Id': activeModelId,
+        'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
+        ...(attempt.via ? { 'X-Fallback': `${DEFAULT_TIER}->${attemptTier}`, 'X-Fallback-Reason': attempt.via } : {}),
+        ...corsFor(req),
+      });
+      res.end(servedBody);
+      clearTimeout(timer);
+      return;
+    } catch (err) {
+      const aborted = err?.name === 'AbortError';
+      refundAttempt(aborted ? 'timeout' : err?.message);
+      const outcome = handleFailure({
+        kind: aborted ? 'timeout' : 'network',
+        message: String(err?.message ?? err),
+      });
+      clearTimeout(timer);
+      if (outcome === 'continue') continue;
+      return;
     }
-
-    // translate the upstream's answer back into the contract the browser speaks, before it is
-    // cached, so a replay serves the same shape the live call did
-    text = shapeSparkResponse(route.key, text, upstreamCtype);
-    text = shapeSamResponse(route.key, text, samFrame, SAM_CONCEPT);
-    // both adapters emit JSON; an SSE content-type would be a lie downstream and would skip _meta
-    if (!upstreamCtype.includes('json') && text.trimStart().startsWith('{')) upstreamCtype = 'application/json';
-
-    const sampleWritten = await recordUsageSample(
-      url.pathname, upstream.status, text, billingHeaders(upstream.headers), reconciliation,
-    );
-    if (sampleWritten) log(`SAMPLE ${url.pathname} -> ${USAGE_SAMPLE_PATH}`);
-
-    // only successful responses are worth replaying
-    await writeCache(hash, {
-      hash,
-      route: url.pathname,
-      status: upstream.status,
-      contentType: upstreamCtype,
-      body: text,
-      costUsd: nextCost,
-      recordedAtUtc: new Date().toISOString(),
-      upstream: upstreamUrl.replace(/\/\/.*@/, '//'),
-    });
-
-    const servedBody = stampMeta(text, upstreamCtype, {
-      activeRoute: route.key,
-      modelTier: tier,
-      modelId: activeModelId,
-      cached: false,
-      costUsd: nextCost,
-      actualCostUsd: reconciliation.actualUsd,
-      ledgerSpentUsd: round6(ledger.totalSpendUsd),
-      sessionSpendUsd: round6(sessionSpendUsd),
-      cacheHits: ledger.cacheHits,
-    });
-
-    res.writeHead(upstream.status, {
-      'Content-Type': upstreamCtype,
-      'Content-Length': Buffer.byteLength(servedBody),
-      'X-Proxy-Cost': nextCost.toFixed(3),
-      'X-Proxy-Cost-Actual': reconciliation.actualUsd === null ? 'unknown' : String(reconciliation.actualUsd),
-      'X-Proxy-Cache': cached ? 'miss-recorded' : 'miss',
-      'X-Model-Tier': tier || 'n/a',
-      'X-Model-Id': activeModelId,
-      'X-Proxy-Ledger-Usd': round6(ledger.totalSpendUsd).toFixed(6),
-      ...corsFor(req),
-    });
-    res.end(servedBody);
-  } catch (err) {
-    const aborted = err?.name === 'AbortError';
-    ledger.totalSpendUsd = round6(Math.max(0, ledger.totalSpendUsd - nextCost));
-    sessionSpendUsd = round6(Math.max(0, sessionSpendUsd - nextCost));
-    ledger.byRoute[route.key].spendUsd = round6(Math.max(0, ledger.byRoute[route.key].spendUsd - nextCost));
-    ledger.refundedUsd = round6(ledger.refundedUsd + nextCost);
-    ledger.failedCalls += 1;
-    saveLedger();
-    log(`REFUND ${url.pathname} (${aborted ? 'timeout' : err?.message}) -> lifetime $${ledger.totalSpendUsd.toFixed(2)}`);
-    json(req, res, aborted ? 504 : 502, {
-      error: aborted ? 'upstream_timeout' : 'upstream_unreachable',
-      message: String(err?.message ?? err),
-    });
-  } finally {
-    clearTimeout(timer);
   }
+
+  // every planned attempt failed and each one answered already
+  json(req, res, 502, {
+    error: 'all_attempts_failed',
+    message: 'Every upstream in the failover plan failed.',
+    lastFailure: lastFailure ? { kind: lastFailure.kind, status: lastFailure.status ?? null } : null,
+  });
 });
 
 server.listen(PORT, HOST, () => {
@@ -971,6 +1167,10 @@ server.listen(PORT, HOST, () => {
     const url = cfg.url() || '(not configured)';
     console.log(`  tier    : ${name.padEnd(13)} ${cfg.id}  $${cfg.cost()}  -> ${url}`);
   }
+  console.log(`  failover: ${FALLBACK_MODE}` +
+    (FALLBACK_MODE === 'auto'
+      ? `  primary -> ${FALLBACK_TIER} on [${[...FALLBACK_TRIGGERS].join(',')}] cooldown ${FALLBACK_COOLDOWN_MS}ms`
+      : '  (set FALLBACK_MODE=auto to fail over)'));
   console.log(`  cache   : ${CACHE_MODE} -> ${CACHE_DIR}`);
   console.log(`  ledger  : ${LEDGER_PATH}`);
   console.log('');
