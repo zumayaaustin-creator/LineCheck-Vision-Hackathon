@@ -154,6 +154,50 @@ const FALLBACK_TRIGGERS = new Set(
 );
 const FALLBACK_TOOL_JSON = String(process.env.PROXY_FALLBACK_TOOL_JSON ?? 'true') !== 'false';
 
+/**
+ * The fallback model needs to be told the JSON contract explicitly. Measured on the Cloudflare
+ * Workers AI build of Llama 3.2 11B Vision: with the primary system prompt plus a `tools` array it
+ * answered with a bare tool NAME and no arguments (safe to ignore), and with no tools at all it
+ * invented names like "Inventory". Given this instruction (names + one example) it produced the
+ * exact object both times, at temperature 0 and 0.2.
+ *
+ *   PROXY_FALLBACK_SYSTEM   override the whole instruction; {tools} and {example} are substituted
+ */
+const FALLBACK_SYSTEM_TEMPLATE =
+  process.env.PROXY_FALLBACK_SYSTEM ||
+  'You are LineCheck, a kitchen HUD assistant. Available tools: {tools}. '
+  + 'Choose exactly one tool and answer with ONLY a JSON object, no prose, no markdown fences, '
+  + 'using this exact shape:\n{example}\n'
+  + 'Use the numeric weight in grams and a short lowercase reason.';
+
+/** Build the fallback instruction from the tools the caller actually offered. */
+function buildFallbackSystem(toolNames) {
+  const names = toolNames.length ? toolNames.join(', ') : 'record_waste, calculate_yield, tare_scale, verify_pan_depth';
+  const first = toolNames[0] || 'record_waste';
+  const example = JSON.stringify({ tool: { name: first, arguments: { ingredient: 'salmon trim', weight_g: 900, reason: 'trim waste' } } });
+  return FALLBACK_SYSTEM_TEMPLATE.replaceAll('{tools}', names).replaceAll('{example}', example);
+}
+
+/** The tool names an OpenAI body offers (both `tools[].function.name` and the linecheck shape). */
+function offeredToolNames(body) {
+  if (!Array.isArray(body?.tools)) return [];
+  return body.tools
+    .map((t) => t?.function?.name ?? t?.name)
+    .filter((n) => typeof n === 'string' && n.length > 0);
+}
+
+/** Rewrite the system message of an OpenAI body for the fallback attempt. Returns the new body or null. */
+function withFallbackSystem(rawBody, names) {
+  let parsed;
+  try { parsed = JSON.parse(rawBody.toString('utf8')); } catch { return null; }
+  if (!Array.isArray(parsed.messages) || !parsed.messages.length) return null;
+  const instruction = buildFallbackSystem(names);
+  const idx = parsed.messages.findIndex((m) => m?.role === 'system');
+  if (idx >= 0) parsed.messages[idx] = { ...parsed.messages[idx], content: instruction };
+  else parsed.messages.unshift({ role: 'system', content: instruction });
+  return Buffer.from(JSON.stringify(parsed), 'utf8');
+}
+
 /** When the primary is known-bad, skip straight to the fallback tier until this timestamp. */
 let primaryDownUntil = 0;
 
@@ -217,7 +261,7 @@ function firstJsonObject(text) {
 }
 
 /** OpenAI chat body -> linecheck `{tool:{name,arguments}}` when the model replied with JSON text. */
-function shapeFallbackToolJson(routeKey, payload, contentType, enabled = FALLBACK_TOOL_JSON) {
+function shapeFallbackToolJson(routeKey, payload, contentType, allowedNames = null, enabled = FALLBACK_TOOL_JSON) {
   if (!enabled || routeKey !== 'spark') return payload;
   if (!String(contentType).includes('json')) return payload;
   let parsed;
@@ -235,6 +279,9 @@ function shapeFallbackToolJson(routeKey, payload, contentType, enabled = FALLBAC
       ? { name: candidate.name, arguments: candidate.arguments ?? {} }
       : null);
   if (!tool?.name) return payload;
+  // An offered-tools list is authoritative: a name the caller never sent is an invention, and
+  // passing it through would let the model create state the app has no handler for.
+  if (allowedNames && allowedNames.length && !allowedNames.includes(tool.name)) return payload;
 
   return JSON.stringify({
     tool: { name: tool.name, arguments: tool.arguments ?? {} },
@@ -1014,13 +1061,28 @@ const server = createServer(async (req, res) => {
     };
 
     try {
+      // The fallback tier gets a deterministic JSON instruction built from the tools actually sent.
+      // Only for the failover attempt: the primary route must receive the caller's own prompt.
+      let attemptRaw = raw;
+      let fallbackNames = null;
+      if (attempt.via && route.key === 'spark' && SPARK_PROTOCOL === 'openai' && ctype.includes('json') && raw.length) {
+        let parsedForTools = null;
+        try { parsedForTools = JSON.parse(raw.toString('utf8')); } catch { parsedForTools = null; }
+        fallbackNames = offeredToolNames(parsedForTools);
+        const rewritten = withFallbackSystem(raw, fallbackNames);
+        if (rewritten) {
+          attemptRaw = rewritten;
+          log(`FALLBACK SYSTEM rewritten for ${attempt.tier} (${fallbackNames.length} tools offered)`);
+        }
+      }
+
       const upstream = await fetch(upstreamUrl, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${activeKey}`, // credential never leaves the server
           ...(ctype.includes('multipart') ? {} : { 'Content-Type': ctype || 'application/json' }),
         },
-        body: raw.length ? raw : undefined,
+        body: attemptRaw.length ? attemptRaw : undefined,
         signal: controller.signal,
       });
 
@@ -1071,7 +1133,7 @@ const server = createServer(async (req, res) => {
       // translate the upstream's answer back into the contract the browser speaks, before it is
       // cached, so a replay serves the same shape the live call did
       text = shapeSparkResponse(route.key, text, upstreamCtype);
-      text = shapeFallbackToolJson(route.key, text, upstreamCtype);
+      text = shapeFallbackToolJson(route.key, text, upstreamCtype, fallbackNames);
       text = shapeSamResponse(route.key, text, samFrame, SAM_CONCEPT);
       // both adapters emit JSON; an SSE content-type would be a lie downstream and would skip _meta
       if (!upstreamCtype.includes('json') && text.trimStart().startsWith('{')) upstreamCtype = 'application/json';

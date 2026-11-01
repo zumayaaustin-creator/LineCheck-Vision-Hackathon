@@ -356,3 +356,45 @@ test('a 400 from the primary is NOT a failover trigger (same malformed request e
     });
   } finally { await primary.close(); await fallback.close(); }
 });
+
+test('the failover attempt receives a JSON instruction built from the tools actually offered', async () => {
+  const primary = fakeUpstream((req, res) => jsonReply(res, 503, { error: 'down' }));
+  const fallback = fakeUpstream((req, res) => fallbackJsonTool(res, { tool: 'record_waste' }));
+  const [pPort, fPort] = [await primary.listen(), await fallback.listen()];
+  try {
+    await withProxy({ primary: pPort, fallback: fPort, tuning: { FALLBACK_MODE: 'auto' } }, async ({ call }) => {
+      const r = await call(hudBody());
+      assert.equal(r.status, 200);
+
+      // what the fallback upstream actually received
+      const sent = fallback.state.bodies[0];
+      const sys = (sent.messages ?? []).find((m) => m.role === 'system');
+      assert.ok(sys, 'a system message was sent to the fallback');
+      const text = typeof sys.content === 'string' ? sys.content : JSON.stringify(sys.content);
+      assert.match(text, /record_waste/, 'the offered tool names are in the instruction');
+      assert.match(text, /ONLY a JSON object/i, 'the JSON contract is stated explicitly');
+      assert.match(text, /"tool"/, 'an example object is included');
+
+      // the primary must NOT get that rewrite: it gets the caller's own prompt
+      const primarySent = primary.state.bodies[0];
+      const primarySys = (primarySent.messages ?? []).find((m) => m.role === 'system');
+      assert.ok(!primarySys || !/ONLY a JSON object/i.test(JSON.stringify(primarySys.content)),
+        'the primary route keeps the caller prompt');
+    });
+  } finally { await primary.close(); await fallback.close(); }
+});
+
+test('a fallback reply naming a tool the caller never offered is refused, not passed through', async () => {
+  const primary = fakeUpstream((req, res) => jsonReply(res, 503, { error: 'down' }));
+  // the model invents "Inventory" - observed on the real endpoint when tools were absent
+  const fallback = fakeUpstream((req, res) => fallbackJsonTool(res, { tool: 'Inventory' }));
+  const [pPort, fPort] = [await primary.listen(), await fallback.listen()];
+  try {
+    await withProxy({ primary: pPort, fallback: fPort, tuning: { FALLBACK_MODE: 'auto' } }, async ({ call }) => {
+      const r = await call(hudBody());
+      assert.equal(r.status, 200, 'the HTTP call still succeeds');
+      assert.equal(r.json?.tool, undefined, 'no invented tool is handed to the HUD');
+      assert.ok(r.json?.choices, 'the raw OpenAI body is passed through instead, so the client can decide');
+    });
+  } finally { await primary.close(); await fallback.close(); }
+});

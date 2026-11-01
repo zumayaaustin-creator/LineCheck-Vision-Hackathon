@@ -133,3 +133,78 @@ Measured on 2026-10-31 with fixtures 4 (not the real endpoint - no Modal credent
   volume warm. `min_containers=0` keeps idle cost at zero; warm the route before walking on stage.
 * **Scope: the Spark role only.** SAM 3.1 has no open-weight drop-in here; a segmentation fallback
   would be a different model and a different contract.
+
+---
+
+## Deployed route: Cloudflare Worker in front of Workers AI (live, free tier)
+
+Modal's GPU functions require a payment method on the account regardless of credit balance, and
+Llama 3.2 Vision cannot run on this laptop (Ollama and every LM Studio llama.cpp backend have dropped
+the `mllama` architecture). So the fallback that actually runs is a **Cloudflare Worker** calling
+Workers AI's `@cf/meta/llama-3.2-11b-vision-instruct` - same Meta weights, OpenAI-compatible face,
+free daily neuron allowance, no card.
+
+```
+HUD -> proxy :8795 -> [primary dead] -> https://linecheck-fallback.zumayaaustin.workers.dev
+                                         -> env.AI.run(@cf/meta/llama-3.2-11b-vision-instruct)
+```
+
+| piece | path |
+|---|---|
+| Worker source | `fallback/worker/src/index.mjs` |
+| Worker config | `fallback/worker/wrangler.toml` (AI binding, model id) |
+| Unit tests (no account needed) | `fallback/worker/test.mjs` - `node --test fallback/worker/test.mjs` |
+| Deployed URL | `https://linecheck-fallback.zumayaaustin.workers.dev` |
+
+Wiring:
+
+```bash
+export META_OPEN_WEIGHTS_SPARK_URL=https://linecheck-fallback.zumayaaustin.workers.dev/v1/chat/completions
+export META_OPEN_WEIGHTS_MODEL=llama-3.2-11b-vision
+export MODAL_API_KEY=<FALLBACK_API_KEY from ~/.linecheck/fallback.env>
+export FALLBACK_MODE=auto
+export PROXY_SPARK_PROTOCOL=openai
+```
+
+Redeploy:
+
+```bash
+cd fallback/worker
+npx wrangler deploy                       # prints the URL
+npx wrangler secret put FALLBACK_API_KEY  # from stdin, never as an argument
+```
+
+### Four things that only showed up against the real endpoint
+
+1. **The model is licence-gated at Workers AI.** Every inference returns `5016 ... you must submit
+   the prompt 'agree'` until the account accepts. The acceptance call needs the model's native
+   `prompt` shape, which an OpenAI request never carries, so the Worker exposes
+   `POST /__agree` (bearer-protected, idempotent). A successful acceptance is *reported as the same
+   5016 error* with the text "Thank you for agreeing..." - the route treats that as success.
+2. **A top-level `image` parameter is deprecated and silently ignored.** Bytes travel fine and the
+   model answers "There is no image" with text-only prompt tokens (~21 instead of ~1600). Images must
+   travel **inside `messages`** as OpenAI content parts. Measured: 64x64 red PNG -> "Red." and 1,623
+   prompt tokens.
+3. **Workers AI parses a JSON-looking reply into an object**, so `content` arrived as
+   `{tool:{...}}` and any string consumer saw `"[object Object]"`. The Worker now stringifies
+   non-string replies, keeping OpenAI's contract (`content` is a string).
+4. **The model invents tool names when it is not given any.** With `tools` forwarded it returns
+   native `tool_calls`; without them it answered bare names like `Inventory` / `calculate_waste`.
+   Two guards: the Worker forwards `tools`, and the proxy refuses a tool name the caller never
+   offered (`shapeFallbackToolJson`) rather than creating state the app cannot handle.
+
+The proxy also rewrites the system prompt **only on the fallback attempt** (`buildFallbackSystem`),
+stating the allowed tool names and the JSON shape with an example - measured necessary when the model
+would otherwise answer with a bare name and no arguments.
+
+### Measured, 2026-10-31 (live Cloudflare route)
+
+```
+contract: 6/6  (health, models, text, image, tool-JSON, wrong-bearer 401)
+proxy:    HTTP 200  X-Fallback: primary->open-weights  X-Model-Tier: open-weights
+          body {tool:{name:"record_waste",arguments:{ingredient:"salmon trim",weight_g:900,reason:"trim"}}}
+worker unit tests: 9/9      proxy failover suite: 11/11
+```
+
+Not yet done on this route: the in-browser HUD pass (the footer/telemetry proof was run against the
+local fixture, which exercises the same code path).

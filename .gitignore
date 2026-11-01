@@ -66,3 +66,6 @@ tmp/
 # python artifacts (fallback/ is a python app inside a JS repo)
 __pycache__/
 *.pyc
+
+# cloudflare worker local state
+fallback/worker/.wrangler/

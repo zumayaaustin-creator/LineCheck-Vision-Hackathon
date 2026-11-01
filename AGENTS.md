@@ -45,7 +45,8 @@ npm run build         # production bundle
 
 # from the repo root - the fallback route and its switch
 node fallback/contract.mjs --self-test        # OpenAI-compatible contract checker
-node --test harness/tests/proxy-fallback.test.mjs   # 9 failover cases, real proxy + real ledger
+node --test harness/tests/proxy-fallback.test.mjs   # 11 failover cases, real proxy + real ledger
+node --test fallback/worker/test.mjs          # 9 Worker translation cases, no account needed
 ```
 
 Then exercise it in a browser. A green build is not evidence the HUD renders correctly: several
@@ -75,7 +76,9 @@ throttling, local mock contracts, key proxy with ceiling, microphone capture wit
 Not working yet: live Meta calls (the live branch has only ever spoken to the local mock), wake
 word, real camera frames.
 
-Fallback route (`fallback/`): built and verified against local fakes of the same wire contract -
-contract checker, 9 proxy failover cases, and a browser run that shows `TIER:open-weights` in the
-footer. **Not deployed**: no Modal or Hugging Face token exists on this machine yet, so
-`modal deploy` has never run.
+Fallback route (`fallback/`): **live** as a Cloudflare Worker over Workers AI
+(`@cf/meta/llama-3.2-11b-vision-instruct`) at
+`https://linecheck-fallback.zumayaaustin.workers.dev`, OpenAI-compatible, free tier, no card.
+6/6 contract checks against the deployed endpoint, 11/11 proxy failover cases, 9/9 Worker unit tests.
+`fallback/modal_app.py` (self-hosted vLLM on Modal) is built and image-validated but cannot deploy
+without a payment method on the Modal account; it stays as the self-hosted option.

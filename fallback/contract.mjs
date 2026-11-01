@@ -31,6 +31,10 @@ const BASE = (argOf('--url', 'http://127.0.0.1:8000') || '').replace(/\/+$/, '')
 const KEY = argOf('--key', process.env.FALLBACK_API_KEY || (SELF_TEST ? 'self-test-key' : ''));
 const MODEL = argOf('--model', process.env.FALLBACK_SERVED_MODEL_NAME || 'llama-3.2-11b-vision');
 const TIMEOUT_MS = Number(argOf('--timeout', '180000'));
+const PROVIDER = (argOf('--provider', '') || '').toLowerCase();
+// A local Ollama has no auth layer at all: it accepts any bearer token, so asserting a 401 would
+// test nothing. vLLM behind --api-key does enforce it, which is why this stays on by default.
+const AUTH_CHECK = !args.includes('--no-auth-check') && PROVIDER !== 'ollama';
 
 // 1x1 PNG - a real image part, small enough to inline, so the vision path is exercised for real.
 const PIXEL_PNG =
@@ -111,8 +115,17 @@ function firstJsonObject(text) {
 }
 
 async function runContract(base) {
+  // vLLM exposes /health; Ollama does not, it exposes /api/tags. Accept either, and say which one
+  // answered so a reader can tell a healthy vLLM from a healthy Ollama.
   const health = await call(base, '/health');
-  record('GET /health returns 200', health.status === 200, `status ${health.status}`);
+  if (health.status === 200) {
+    record('GET /health returns 200 (vLLM surface)', true, 'status 200');
+  } else {
+    const tags = await call(base, '/api/tags');
+    record('GET /health returns 200 (or /api/tags on Ollama)',
+      tags.status === 200,
+      `health ${health.status}, /api/tags ${tags.status}`);
+  }
 
   const models = await call(base, '/v1/models');
   const ids = (models.json?.data ?? []).map((m) => m.id);
@@ -167,9 +180,13 @@ async function runContract(base) {
   record('fallback reply parses into a tool object', toolish.status === 200 && Boolean(toolName),
     toolName ? `tool=${toolName}` : `unparseable: ${String(content).slice(0, 120)}`);
 
-  const badAuth = await call(base, '/v1/models', { key: 'definitely-wrong-key' });
-  record('wrong bearer token is rejected', badAuth.status === 401 || badAuth.status === 403,
-    `status ${badAuth.status}`);
+  if (AUTH_CHECK) {
+    const badAuth = await call(base, '/v1/models', { key: 'definitely-wrong-key' });
+    record('wrong bearer token is rejected', badAuth.status === 401 || badAuth.status === 403,
+      `status ${badAuth.status}`);
+  } else {
+    console.log('SKIP wrong bearer token is rejected - this provider has no auth layer (--provider ollama / --no-auth-check)');
+  }
 
   return checks;
 }
