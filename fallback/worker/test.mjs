@@ -39,6 +39,16 @@ const post = (path, body, headers = {}) => new Request(`https://worker.test${pat
   method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body),
 });
 
+test('GET / explains what this endpoint is instead of 404ing on a bare click', async () => {
+  const { env } = stubEnv();
+  const res = await worker.fetch(new Request('https://worker.test/'), env);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.service, 'linecheck-fallback-worker');
+  assert.match(body.what, /not a user interface/);
+  assert.ok(body.endpoints['POST /v1/chat/completions']);
+});
+
 test('GET /health answers and names the model', async () => {
   const { env } = stubEnv();
   const res = await worker.fetch(new Request('https://worker.test/health'), env);

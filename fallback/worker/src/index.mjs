@@ -57,6 +57,26 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
+    // Root: this is an API, not a page. A bare click used to return a 404, which reads as "broken"
+    // to anyone who isn't the proxy. Say what this is and what it serves.
+    if (url.pathname === '/' || url.pathname === '/index.json') {
+      return json({
+        service: 'linecheck-fallback-worker',
+        what: 'OpenAI-compatible endpoint serving an open-weight Meta vision model. '
+          + 'It is a fallback upstream for the LineCheck proxy, not a user interface.',
+        model: env.MODEL,
+        served_model_name: env.SERVED_MODEL_NAME,
+        endpoints: {
+          'GET /health': 'liveness, no auth',
+          'GET /v1/models': 'OpenAI model list, bearer required',
+          'POST /v1/chat/completions': 'OpenAI chat completions (text + image_url parts), bearer required',
+          'POST /__agree': 'one-time licence acceptance for a new account, bearer required',
+        },
+        used_by: 'harness/proxy-server.mjs with FALLBACK_MODE=auto',
+        docs: 'fallback/README.md in the LineCheck-Vision-Hackathon repo',
+      }, 200, cors);
+    }
+
     if (url.pathname === '/health') {
       return json({ status: 'ok', service: 'linecheck-fallback-worker', model: env.MODEL }, 200, cors);
     }
