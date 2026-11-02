@@ -153,13 +153,12 @@ flowchart LR
         RESET[POST /reset]
     end
 
-    subgraph STORE[(.cache/kitchen-ops-ledger.json)]
-        PAR[parStock
-{ingredient: {parG, currG}}]
-        WASTE[wasteLog[]]
-        YIELD[yieldLog[]]
-        TARE[activeContainer, activeTareG]
-        AUDIT[panDepthAudit[]]
+    subgraph STORE["Kitchen Ledger Store"]
+        PAR[(parStock: {ingredient: {parG, currG}})]
+        WASTE[(wasteLog[])]
+        YIELD[(yieldLog[])]
+        TARE[(activeContainer, activeTareG)]
+        AUDIT[(panDepthAudit[])]
     end
 
     TOOLS --> LOG
@@ -168,9 +167,9 @@ flowchart LR
     LOG -->|append| YIELD
     LOG -->|update| TARE
     LOG -->|append| AUDIT
-    STATE -->|read| STORE
-    RESET -->|clear| STORE
-    STORE -->|poll 5s| PANEL[Telemetry Panel T]
+    STATE -->|read| PAR
+    RESET -->|clear| PAR
+    PAR -->|poll 5s| PANEL[Telemetry Panel T]
 ```
 
 ---
