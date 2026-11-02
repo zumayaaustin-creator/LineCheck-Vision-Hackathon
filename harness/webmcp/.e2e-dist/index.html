@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LineCheck Vision — 600x600 Ray-Ban HUD</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #050505;
+        color: #00F0FF;
+        font-family: 'Consolas', 'Courier New', monospace;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+      }
+      .hud-frame {
+        width: 600px;
+        height: 600px;
+        position: relative;
+        border: 2px solid #00F0FF;
+        box-shadow: 0 0 20px rgba(0, 240, 255, 0.25);
+        background: #0A0A0A;
+        overflow: hidden;
+      }
+      .hud-header {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        right: 12px;
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        letter-spacing: 1px;
+        color: #FFE600;
+        z-index: 10;
+      }
+      .hud-canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .hud-footer {
+        position: absolute;
+        bottom: 12px;
+        left: 12px;
+        right: 12px;
+        font-size: 10px;
+        color: #A800FF;
+        display: flex;
+        justify-content: space-between;
+        z-index: 10;
+      }
+      .status-pill {
+        background: rgba(0, 240, 255, 0.1);
+        padding: 2px 6px;
+        border: 1px solid #00F0FF;
+        border-radius: 2px;
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/index-DytoSt8H.js"></script>
+  </head>
+  <body>
+    <div class="hud-frame">
+      <div class="hud-header">
+        <span>LINECHECK VISION // HUD</span>
+        <span class="status-pill" id="mcp-status">MOCK IPC: READY</span>
+      </div>
+      <canvas id="vision-canvas" class="hud-canvas" width="600" height="600"></canvas>
+      <div class="hud-footer">
+        <span id="audio-status">MUSE AUDIO: LISTENING</span>
+        <span>600x600 FIXED</span>
+      </div>
+    </div>
+  </body>
+</html>

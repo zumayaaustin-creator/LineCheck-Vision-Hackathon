@@ -1,0 +1,9 @@
+{
+  "folders": [
+    { "name": "1_LineCheck_Hackathon_Repo", "path": "D:\\Projects\\LineCheck-Vision-Hackathon" },
+    { "name": "2_Obsidian_Source_Of_Truth", "path": "C:\\Users\\Austin\\ObsidianVault" }
+  ],
+  "settings": {
+    "files.exclude": { "**/.git": true, "**/node_modules": true, "**/.obsidian": true }
+  }
+}

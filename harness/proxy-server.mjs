@@ -352,14 +352,19 @@ const USAGE_SAMPLE_PATH = process.env.PROXY_USAGE_SAMPLE_PATH || '.cache/live-us
 const CACHE_MODE = process.env.PROXY_CACHE_MODE || 'record-or-replay';
 const CACHE_DIR  = process.env.PROXY_CACHE_DIR || '.cache/replay';
 const LEDGER_PATH = process.env.PROXY_LEDGER_PATH || '.cache/spend-ledger.json';
+const KITCHEN_LEDGER_PATH = process.env.KITCHEN_LEDGER_PATH || '.cache/kitchen-ops-ledger.json';
 
 const ALLOWED_ORIGINS = (process.env.PROXY_ALLOWED_ORIGINS ||
-  'http://127.0.0.1:8099,http://localhost:8099,http://127.0.0.1:5173,http://localhost:5173').split(',');
+  'http://127.0.0.1:8099,http://localhost:8099,http://127.0.0.1:5173,http://localhost:5173,https://localhost:8081').split(',');
 
 const ROUTES = {
   '/sam-3.1/segment':       { upstream: SAM_URL,   cost: COST.sam,   key: 'sam'   },
   '/muse-audio/transcribe': { upstream: MUSE_URL,  cost: COST.muse,  key: 'muse'  },
   '/muse-spark/dispatch':   { upstream: SPARK_URL, cost: COST.spark, key: 'spark' },
+  // Kitchen ledger endpoints (handled inline, not via ROUTES)
+  // GET  /__kitchen/state  -> current kitchen state
+  // POST /__kitchen/log    -> log an entry { type, ... }
+  // POST /__kitchen/reset  -> reset to empty
 };
 
 // ---------------------------------------------------------------- ledger (persistent)
@@ -416,6 +421,123 @@ function saveLedger() {
     console.error(`[proxy] ERROR: could not persist ledger (${err.message})`);
   }
 }
+
+
+
+// ---------------------------------------------------------------- Kitchen Operations Ledger
+const emptyKitchenLedger = () => ({
+  version: 1,
+  parStock: {
+    'Default Ingredient': { parGrams: 5000, currentGrams: 5000, unit: 'g' },
+  },
+  wasteLog: [],
+  yieldLog: [],
+  activeContainer: null,
+  activeTareGrams: 0,
+  panDepthAudit: [],
+  createdAtUtc: new Date().toISOString(),
+  updatedAtUtc: new Date().toISOString(),
+});
+
+function loadKitchenLedger() {
+  try {
+    if (!existsSync(KITCHEN_LEDGER_PATH)) return emptyKitchenLedger();
+    const parsed = JSON.parse(readFileSync(KITCHEN_LEDGER_PATH, 'utf8'));
+    const base = emptyKitchenLedger();
+    return {
+      ...base,
+      ...parsed,
+      parStock: { ...base.parStock, ...(parsed.parStock || {}) },
+    };
+  } catch (err) {
+    console.error(`[proxy] WARN: kitchen ledger unreadable (${err.message}); starting a fresh one at ${KITCHEN_LEDGER_PATH}`);
+    return emptyKitchenLedger();
+  }
+}
+
+let kitchenLedger = loadKitchenLedger();
+
+function saveKitchenLedger(ledger) {
+  ledger.updatedAtUtc = new Date().toISOString();
+  try {
+    mkdirSync(path.dirname(KITCHEN_LEDGER_PATH), { recursive: true });
+    const tmp = `${KITCHEN_LEDGER_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+    renameSync(tmp, KITCHEN_LEDGER_PATH);
+  } catch (err) {
+    console.error(`[proxy] ERROR: could not persist kitchen ledger (${err.message})`);
+  }
+}
+
+/**
+ * Apply a log entry to the kitchen ledger.
+ * Entry types:
+ *   - 'waste': { type: 'waste', ingredient, weight_g, reason }
+ *   - 'yield': { type: 'yield', ingredient, ap_weight_g, ep_weight_g, trim_weight_g }
+ *   - 'tare': { type: 'tare', container, tare_grams }
+ *   - 'audit': { type: 'audit', pan_type, fill_percentage, note }
+ */
+function applyKitchenLog(ledger, entry) {
+  const now = new Date().toISOString();
+  const newLedger = { ...ledger, parStock: { ...ledger.parStock } };
+
+  switch (entry.type) {
+    case 'waste': {
+      const { ingredient, weight_g, reason } = entry;
+      if (!ingredient || typeof weight_g !== 'number') break;
+      // Auto-create ingredient if new
+      if (!newLedger.parStock[ingredient]) {
+        newLedger.parStock[ingredient] = { parGrams: 5000, currentGrams: 5000, unit: 'g' };
+      }
+      newLedger.parStock[ingredient].currentGrams =
+        Math.max(0, newLedger.parStock[ingredient].currentGrams - weight_g);
+      newLedger.wasteLog.push({ ...entry, timestamp: now });
+      break;
+    }
+    case 'yield': {
+      const { ingredient, ap_weight_g, ep_weight_g, trim_weight_g } = entry;
+      if (!ingredient) break;
+      // Auto-create ingredient if new
+      if (!newLedger.parStock[ingredient]) {
+        newLedger.parStock[ingredient] = { parGrams: 5000, currentGrams: 5000, unit: 'g' };
+      }
+      // AP weight is what we started with, EP is what we got, trim is waste
+      const netChange = (ap_weight_g || 0) - (ep_weight_g || 0) - (trim_weight_g || 0);
+      newLedger.parStock[ingredient].currentGrams += netChange;
+      newLedger.yieldLog.push({ ...entry, timestamp: now });
+      break;
+    }
+    case 'tare':
+    case 'tare_scale': {
+      const { container, tare_grams, unit } = entry;
+      newLedger.activeContainer = container || null;
+      newLedger.activeTareGrams = tare_grams || 0;
+      newLedger.parStock = { ...newLedger.parStock }; // ensure shallow copy
+      break;
+    }
+    case 'audit':
+    case 'verify_pan_depth': {
+      const { pan_type, fill_percentage, note } = entry;
+      if (!pan_type) break;
+      newLedger.panDepthAudit.push({
+        panType: pan_type,
+        fillPercentage: fill_percentage || 0,
+        note: note || '',
+        timestamp: now,
+      });
+      break;
+    }
+    default:
+      // Unknown type - still log it but don't mutate stock
+      if (!entry.type.startsWith('_')) {
+        console.warn(`[proxy] Unknown kitchen log type: ${entry.type}`);
+      }
+  }
+
+  return newLedger;
+}
+
+
 
 // ---------------------------------------------------------------- cache
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -817,6 +939,31 @@ const server = createServer(async (req, res) => {
       },
       updatedAtUtc: ledger.updatedAtUtc,
     });
+    return;
+  }
+
+  // ---- Kitchen Operations Ledger endpoints ----
+  if (url.pathname === '/__kitchen/state' && req.method === 'GET') {
+    json(req, res, 200, kitchenLedger);
+    return;
+  }
+  if (url.pathname === '/__kitchen/log' && req.method === 'POST') {
+    let body = await readBody(req);
+    try {
+      const entry = JSON.parse(body.toString('utf8'));
+      // entry: { type: 'waste'|'yield'|'tare'|'audit', ... }
+      kitchenLedger = applyKitchenLog(kitchenLedger, entry);
+      saveKitchenLedger(kitchenLedger);
+      json(req, res, 200, { ok: true, saved: true, state: kitchenLedger });
+    } catch (err) {
+      json(req, res, 400, { error: 'invalid_log_entry', message: String(err) });
+    }
+    return;
+  }
+  if (url.pathname === '/__kitchen/reset' && req.method === 'POST') {
+    kitchenLedger = emptyKitchenLedger();
+    saveKitchenLedger(kitchenLedger);
+    json(req, res, 200, { ok: true, state: kitchenLedger });
     return;
   }
 

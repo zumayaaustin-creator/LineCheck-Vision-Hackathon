@@ -9,6 +9,10 @@ import { runHudSelfTest } from './selftest';
 import { camera, cameraSupported } from './camera';
 import { WakeWord } from './wakeword';
 
+// ---- Photo Loader / Scene Slots ----
+const SCENE_STORAGE_KEY = 'linecheck-scenes';
+const DEMO_FRAMES_DIR = '/demo-frames/';
+
 const canvas =
   document.querySelector<HTMLCanvasElement>('#hud-canvas') ||
   document.querySelector<HTMLCanvasElement>('canvas');
@@ -21,6 +25,194 @@ if (canvas) {
   canvas.width = HUD_SIZE;
   canvas.height = HUD_SIZE;
 }
+
+// ---- Scene/Photo Loader State ----
+let loadedScenes: Map<number, { dataUrl: string; name: string; width: number; height: number; source: string; loadedAt: string }> = new Map();
+let activeScene: number | null = null;
+let telemetryPanelOpen = true;
+let customFrameDataUrl: string | null = null;
+let customFrameDims: { width: number; height: number } | null = null;
+let activeContainer: string | null = null;
+let activeTareGrams = 0;
+
+function saveScenesToStorage(): void {
+  try {
+    const obj = Object.fromEntries(loadedScenes.entries());
+    localStorage.setItem(SCENE_STORAGE_KEY, JSON.stringify(obj));
+  } catch (err) {
+    console.warn('[HUD] Failed to save scenes to localStorage:', err);
+  }
+}
+
+function loadScenesFromStorage(): void {
+  try {
+    const stored = localStorage.getItem(SCENE_STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      Object.entries(parsed).forEach(([slot, data]) => {
+        const slotNum = Number(slot);
+        if ([1, 2, 3, 4].includes(slotNum)) {
+          loadedScenes.set(slotNum, data as { dataUrl: string; name: string; width: number; height: number; source: string; loadedAt: string });
+        }
+      });
+    }
+  } catch (err) {
+    console.warn('[HUD] Failed to load scenes from localStorage:', err);
+  }
+}
+
+loadScenesFromStorage();
+
+const PROXY_BASE = 'http://127.0.0.1:8790';
+
+// Poll kitchen ledger state from proxy
+setInterval(async () => {
+  try {
+    const resp = await fetch(`${PROXY_BASE}/__kitchen/state`);
+    if (resp.ok) {
+      const kitchen = await resp.json();
+      activeContainer = kitchen.activeContainer || null;
+      activeTareGrams = kitchen.activeTareGrams || 0;
+    }
+  } catch {}
+}, 5000);
+
+async function loadDemoFrame(slot: number): Promise<{ dataUrl: string; name: string; width: number; height: number; source: string; loadedAt: string } | null> {
+  const url = `${DEMO_FRAMES_DIR}scene-${slot}.jpg`;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.drawImage(img, 0, 0);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+      resolve({
+        dataUrl,
+        name: `Demo Scene ${slot}`,
+        width: img.width,
+        height: img.height,
+        source: 'demo',
+        loadedAt: new Date().toISOString(),
+      });
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+async function loadScene(slot: number): Promise<void> {
+  if (loadedScenes.has(slot)) {
+    const scene = loadedScenes.get(slot)!;
+    customFrameDataUrl = scene.dataUrl;
+    customFrameDims = { width: scene.width, height: scene.height };
+    activeScene = slot;
+    console.log(`[HUD] Loaded scene ${slot}: ${scene.name} (${scene.source})`);
+    return;
+  }
+  const demo = await loadDemoFrame(slot);
+  if (demo) {
+    loadedScenes.set(slot, demo);
+    saveScenesToStorage();
+    customFrameDataUrl = demo.dataUrl;
+    customFrameDims = { width: demo.width, height: demo.height };
+    activeScene = slot;
+    console.log(`[HUD] Loaded demo scene ${slot}`);
+    return;
+  }
+  customFrameDataUrl = null;
+  customFrameDims = null;
+  activeScene = slot;
+  console.log(`[HUD] Scene ${slot}: using synthetic grid`);
+}
+
+function handleFileDrop(file: File): void {
+  if (!file.type.startsWith('image/')) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.drawImage(img, 0, 0);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+      let slot = 1;
+      for (let i = 1; i <= 4; i++) {
+        if (!loadedScenes.has(i)) {
+          slot = i;
+          break;
+        }
+      }
+      if (loadedScenes.size >= 4) slot = 1;
+      const scene = {
+        dataUrl,
+        name: file.name,
+        width: img.width,
+        height: img.height,
+        source: 'drag',
+        loadedAt: new Date().toISOString(),
+      };
+      loadedScenes.set(slot, scene);
+      saveScenesToStorage();
+      customFrameDataUrl = scene.dataUrl;
+      customFrameDims = { width: img.width, height: img.height };
+      activeScene = slot;
+      console.log(`[HUD] Dropped image -> slot ${slot}: ${scene.name}`);
+    };
+    img.src = e.target?.result as string;
+  };
+  reader.readAsDataURL(file);
+}
+
+function setupDragAndDrop(): void {
+  const canvasEl = (document.querySelector('#hud-canvas') || document.querySelector('canvas')) as HTMLCanvasElement | null;
+  if (!canvasEl) return;
+  canvasEl.addEventListener('dragover', (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).style.borderColor = '#FCEE0A';
+  });
+  canvasEl.addEventListener('dragleave', (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).style.borderColor = '#00F0FF';
+  });
+  canvasEl.addEventListener('drop', (e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).style.borderColor = '#00F0FF';
+    if (e.dataTransfer?.files.length) {
+      handleFileDrop(e.dataTransfer.files[0]);
+    }
+  });
+  canvasEl.addEventListener('click', async (e: MouseEvent) => {
+    const canvasEl = document.querySelector('#hud-canvas') || document.querySelector('canvas');
+    if (!canvasEl) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    if (x > 450 && y > 500) {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/jpeg,image/png';
+      input.onchange = (e) => {
+        const target = e.target as HTMLInputElement;
+        if (target?.files?.length) handleFileDrop(target.files[0]);
+      };
+      input.click();
+    }
+  });
+}
+
+// Initialize scenes on startup
+(async () => {
+  await loadScene(1);
+  setupDragAndDrop();
+})();
 
 /**
  * Spend readout. Polled from the proxy's local /__usage endpoint on a slow timer - a GET
@@ -123,6 +315,11 @@ function drawFrame() {
   // Drawn last, so a reticle can never sit on top of the telemetry strip or the warning pill.
   drawTelemetryFooter(state);
   drawTierWarning(state);
+  
+  // Draw telemetry panel if open
+  if (telemetryPanelOpen) {
+    drawTelemetryPanel(hudStore.getState());
+  }
 }
 
 /** the continuous loop; `F` calls drawFrame() directly so the footer is honest immediately */
@@ -138,6 +335,67 @@ render();
  * Sits above the HTML `.hud-footer` (which overlays the last ~24px of the frame) rather than
  * under it, and clips itself, so nothing it draws can leave the canvas or cover the footer.
  */
+// ---- Telemetry Panel ----
+function drawTelemetryPanel(_state: HUDState): void {
+  if (!ctx) return;
+
+  // Panel background
+  ctx.fillStyle = '#050505';
+  ctx.fillRect(HUD_SIZE + 10, 0, 280, HUD_SIZE);
+  ctx.strokeStyle = '#00F0FF';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(HUD_SIZE + 10, 0, 280, HUD_SIZE);
+
+  let y = 16;
+
+  // Title
+  ctx.font = 'bold 14px monospace';
+  ctx.fillStyle = '#00F0FF';
+  ctx.fillText('KITCHEN OPS LEDGER', HUD_SIZE + 22, y);
+  y += 26;
+
+  // Inventory
+  ctx.font = 'bold 12px monospace';
+  ctx.fillStyle = '#FCEE0A';
+  ctx.fillText('INVENTORY', HUD_SIZE + 22, y);
+  y += 22;
+
+  // We'll fetch kitchen state synchronously from cached data
+  // The polling interval updates activeContainer/activeTareGrams
+  // For now, show a placeholder
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#555555';
+  ctx.fillText('(polling /__kitchen/state...)', HUD_SIZE + 22, y);
+  y += 20;
+
+  y += 8;
+  // Active Scale / Tare
+  ctx.font = 'bold 12px monospace';
+  ctx.fillStyle = '#FCEE0A';
+  ctx.fillText('SCALE', HUD_SIZE + 22, y);
+  y += 22;
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#00F0FF';
+  ctx.fillText(`Active: ${activeContainer || 'none'}`, HUD_SIZE + 22, y);
+  y += 16;
+  ctx.fillText(`Tare: ${activeTareGrams}g`, HUD_SIZE + 22, y);
+  y += 24;
+
+  // Ledger Save Status
+  ctx.font = 'bold 12px monospace';
+  ctx.fillStyle = '#FCEE0A';
+  ctx.fillText('LEDGER', HUD_SIZE + 22, y);
+  y += 22;
+  ctx.font = '11px monospace';
+  ctx.fillStyle = '#00F0FF';
+  ctx.fillText('Auto-save: ON', HUD_SIZE + 22, y);
+  y += 16;
+  ctx.fillStyle = '#555555';
+  ctx.fillText('File: .cache/kitchen-ops-ledger.json', HUD_SIZE + 22, y);
+  y += 16;
+  ctx.fillText('Auto-save: every change', HUD_SIZE + 22, y);
+}
+
 function drawTelemetryFooter(state: HUDState): void {
   if (!ctx) return;
   const tierColor = state.modelTier === 'open-weights' ? '#BD00FF' : '#00F0FF';
@@ -180,11 +438,11 @@ function drawTelemetryFooter(state: HUDState): void {
 
   ctx.textAlign = 'left';
   ctx.fillStyle = tierColor;
-  ctx.fillText(left, margin, midY);
+  ctx.fillText(left, 12, midY);
 
   ctx.textAlign = 'right';
   ctx.fillStyle = '#FCEE0A';
-  ctx.fillText(right, HUD_SIZE - margin, midY);
+  ctx.fillText(right, HUD_SIZE - 12, midY);
   ctx.restore();
 }
 
@@ -201,18 +459,17 @@ function drawTierWarning(state: HUDState): void {
   ctx.font = 'bold 10px monospace';
   ctx.textBaseline = 'middle';
   const width = Math.min(HUD_SIZE - 24, Math.ceil(ctx.measureText(message).width) + 16);
-  const x = 12;
   const y = FOOTER_STRIP_Y - WARNING_PILL_H - 6;
   ctx.fillStyle = 'rgba(5, 5, 5, 0.92)';
-  ctx.fillRect(x, y, width, WARNING_PILL_H);
+  ctx.fillRect(12, y, width, WARNING_PILL_H);
   ctx.strokeStyle = '#BD00FF';
   ctx.lineWidth = 1;
-  ctx.strokeRect(x + 0.5, y + 0.5, width - 1, WARNING_PILL_H - 1);
+  ctx.strokeRect(12.5, y + 0.5, width - 1, WARNING_PILL_H - 1);
   ctx.beginPath();
-  ctx.rect(x, y, width, WARNING_PILL_H);
+  ctx.rect(12, y, width, WARNING_PILL_H);
   ctx.clip();
   ctx.fillStyle = '#BD00FF';
-  ctx.fillText(message, x + 8, y + WARNING_PILL_H / 2 + 1);
+  ctx.fillText(message, 20, y + WARNING_PILL_H / 2 + 1);
   ctx.restore();
 }
 
@@ -247,8 +504,21 @@ async function triggerSnapshot() {
   hudStore.setStatus('PROCESSING');
 
   try {
-    const frame = camera.capture();
-    lastFrameText = `FRAME: ${frame.source} ${frame.width}x${frame.height}`;
+    let frame;
+    if (customFrameDataUrl && customFrameDims) {
+      // Use custom loaded frame
+      frame = {
+        dataUrl: customFrameDataUrl,
+        width: customFrameDims.width,
+        height: customFrameDims.height,
+        source: activeScene ? `scene-${activeScene}` : 'custom',
+        reason: null,
+      };
+      lastFrameText = `FRAME: scene-${activeScene} ${customFrameDims.width}x${customFrameDims.height}`;
+    } else {
+      frame = camera.capture();
+      lastFrameText = `FRAME: ${frame.source} ${frame.width}x${frame.height}`;
+    }
     if (frame.reason) console.log(`[HUD] frame fallback: ${frame.reason}`);
     console.log(`[HUD] snapshot frame: ${frame.source} ${frame.width}x${frame.height}`);
 
@@ -323,10 +593,27 @@ async function triggerVoice(hint?: string) {
 
     // step 3: WebMCP execution
     console.log('[HUD] 3/3 execute', picked.toolCall.name, JSON.stringify(picked.toolCall.arguments));
-    await executeTool(picked.toolCall.name, picked.toolCall.arguments);
+    const toolResult = await executeTool(picked.toolCall.name, picked.toolCall.arguments);
+    
+    // Log to kitchen ledger via proxy
+    try {
+      await fetch(`${PROXY_BASE}/__kitchen/log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: picked.toolCall.name,
+          ...picked.toolCall.arguments,
+        }),
+      });
+    } catch (err) {
+      console.warn('[HUD] Failed to log to kitchen ledger:', err);
+    }
+    
+    return toolResult;
   } catch (err) {
     console.error('[HUD] voice failed:', err);
     hudStore.setStatus('IDLE');
+    return;
   } finally {
     voiceInFlight = false;
   }
@@ -391,7 +678,9 @@ async function toggleWake() {
 (window as any).toggleWake = toggleWake;
 (window as any).wakeWord = wake;
 
-/** Start the webcam on load; failure is silent and S falls back to a synthetic frame. */
+/**
+ * Start the webcam on load; failure is silent and S falls back to a synthetic frame.
+ */
 async function initCamera() {
   if (!cameraSupported()) {
     lastFrameText = 'FRAME: synthetic (no camera API)';
@@ -444,18 +733,29 @@ window.addEventListener('keydown', async (e) => {
       break;
     }
     case '1':
+    case '2':
+    case '3':
+    case '4':
+      await loadScene(parseInt(e.key));
+      break;
+    case 't':
+    case 'T':
+      telemetryPanelOpen = !telemetryPanelOpen;
+      console.log('[HUD] Telemetry panel:', telemetryPanelOpen ? 'open' : 'closed');
+      break;
+    case '!': // Shift+1
       console.log('[HUD] tare_scale');
       await executeTool('tare_scale', { unit: 'g' });
       break;
-    case '2':
+    case '@': // Shift+2
       console.log('[HUD] calculate_yield');
       await executeTool('calculate_yield', { ap_weight_g: 2200, ep_weight_g: 1650, trim_weight_g: 550 });
       break;
-    case '3':
+    case '#': // Shift+3
       console.log('[HUD] verify_pan_depth (warning)');
       await executeTool('verify_pan_depth', { pan_type: '1/6 Pan', fill_percentage: 15 });
       break;
-    case '4':
+    case '$': // Shift+4
       console.log('[HUD] record_waste (alert)');
       await executeTool('record_waste', { ingredient: 'Pork Collar', weight_g: 450, reason: 'Heavy Silver Skin Trim' });
       break;
