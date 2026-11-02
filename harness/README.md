@@ -490,3 +490,153 @@ Built during the Meta Global AI Developer Hackathon. LineCheck's proprietary kit
 to end; the three model endpoints behind the proxy are mock contracts that mirror the shapes we
 designed against. Every dollar figure shown is the proxy's simulation - actual spend on this build
 is $0.00. The Spark adapter is the one path that is ready for a live key.
+
+
+---
+
+
+## Contract Architecture
+
+```mermaid
+flowchart TD
+    subgraph MOCK["Mock Server :8787"]
+        M_SAM[/sam-3.1/segment/]
+        M_MUSE[/muse-audio/transcribe/]
+        M_SIM[/__simulate/]
+    end
+
+    subgraph PROXY["Proxy Server :8790"]
+        P_SAM[/sam-3.1/segment/]
+        P_MUSE[/muse-audio/transcribe/]
+        P_SPARK[/muse-spark/dispatch/]
+        P_USAGE[/__usage/]
+        P_KITCHEN[/__kitchen/state|log|reset/]
+        P_BUDGET[Budget Gates
+MAX_PAID_CALLS / MAX_SPEND_USD / MAX_SESSION]
+        P_CACHE[Replay Cache
+SHA-256(route+body)]
+        P_TIER{Tier Router
+primary / open-weights}
+        P_FALLBACK[Failover Logic
+status,timeout,network]
+    end
+
+    subgraph UPSTREAM["Upstream APIs"]
+        META[Meta Model API
+SAM 3.1 / Muse / Spark]
+        CF[Cloudflare Worker
+Llama 3.2 Vision]
+    end
+
+    HUD[HUD Browser] -->|VITE_USE_PROXY=true| PROXY
+    HUD -.->|VITE_USE_PROXY=false
+VITE_*_ENDPOINT| MOCK
+    PROXY -->|Budget check FIRST| P_BUDGET
+    P_BUDGET -->|Reserve cost| P_CACHE
+    P_CACHE -->|Miss| P_TIER
+    P_TIER -->|primary| META
+    P_TIER -->|open-weights| CF
+    P_FALLBACK -.->|Cooldown 60s| P_TIER
+    META -.->|Reconcile| P_BUDGET
+    CF -.->|Reconcile| P_BUDGET
+```
+
+## Tool Contract Flow
+
+```mermaid
+sequenceDiagram
+    participant H as HUD
+    participant P as Proxy :8790
+    participant M as Mock/Upstream
+
+    Note over H: User presses V (Voice)
+    H->>P: POST /muse-audio/transcribe (multipart audio)
+    P->>M: Forward
+    M-->>P: {transcription, tool}
+    H->>P: POST /muse-spark/dispatch {transcript, tools[]}
+    P->>M: Forward (with tool schemas)
+    M-->>P: {tool: {name, args}, confidence}
+    H->>H: executeTool(name, args)
+    H->>P: POST /__kitchen/log {type, ...}
+    P->>P: Mutate parStock / append logs
+```
+
+## Budget & Cache Flow
+
+```mermaid
+flowchart TD
+    REQ[Incoming Request] --> GATE1{MAX_PAID_CALLS < 60?}
+    GATE1 -->|no| REJ429[429 call_cap_reached]
+    GATE1 -->|yes| GATE2{MAX_SPEND_USD < $120?}
+    GATE2 -->|no| REJ429[429 budget_exceeded]
+    GATE2 -->|yes| GATE3{SESSION < $5?}
+    GATE3 -->|no| REJ429[429 session_budget_exceeded]
+    GATE3 -->|yes| RESERVE[Reserve COST_PER_*]
+    RESERVE --> CACHE{Cache Hit?}
+    CACHE -->|yes| SERVE[Return Cached $0.00]
+    CACHE -->|no| UPSTREAM[Call Upstream]
+    UPSTREAM -->|2xx| RECONCILE[Read usage → Adjust Ledger]
+    UPSTREAM -->|non-2xx| REFUND[Refund Reservation]
+    RECONCILE --> SAVE[Write Ledger + Cache]
+    REFUND --> SAVE
+```
+
+---
+
+## Quick Reference: Simulate Failures
+
+```bash
+# Per-request
+curl "http://127.0.0.1:8787/sam-3.1/segment?simulate=latency"   # +600ms
+curl "http://127.0.0.1:8787/sam-3.1/segment?simulate=slow"      # +2500ms
+curl "http://127.0.0.1:8787/sam-3.1/segment?simulate=401"       # 401 Unauthorized
+curl "http://127.0.0.1:8787/sam-3.1/segment?simulate=500"       # 500 Server Error
+
+# Sticky mode
+curl -X POST "http://127.0.0.1:8787/__simulate?mode=401"
+curl -X POST "http://127.0.0.1:8787/__simulate?mode=none"
+```
+
+---
+
+## Environment Contract
+
+| Scope | Variable | Required | Default |
+|-------|----------|----------|---------|
+| **Browser (Vite)** | `VITE_USE_MOCK_META` | No | `true` |
+| | `VITE_USE_PROXY` | No | `false` |
+| | `VITE_META_API_KEY` | **Never real** | `""` |
+| | `VITE_SAM_MODEL_ENDPOINT` | If not proxy | - |
+| | `VITE_MUSE_AUDIO_ENDPOINT` | If not proxy | - |
+| **Proxy (Node)** | `META_API_KEY` | **Yes (prod)** | `""` |
+| | `UPSTREAM_BASE` | Or individual URLs | - |
+| | `MAX_PAID_CALLS` | No | `60` |
+| | `MAX_SPEND_USD` | No | `120.00` |
+| | `MAX_SESSION_SPEND_USD` | No | `5.00` |
+| | `PROXY_CACHE_MODE` | No | `record-or-replay` |
+| | `FALLBACK_MODE` | No | `off` |
+| | `FALLBACK_TIER` | No | `open-weights` |
+```
+
+---
+
+## Reproducible Verification
+
+```bash
+# 1. Clean install
+rm -rf node_modules package-lock.json
+npm install
+
+# 2. Type-check + build
+npm run build
+
+# 3. Proxy tests (must pass 11/11)
+node --test tests/proxy-fallback.test.mjs
+
+# 4. Manual smoke test
+node mock-server.mjs &
+sleep 1
+VITE_USE_MOCK_META=false VITE_META_API_KEY=local-test-token VITE_SAM_MODEL_ENDPOINT=http://127.0.0.1:8787/sam-3.1/segment VITE_MUSE_AUDIO_ENDPOINT=http://127.0.0.1:8787/muse-audio/transcribe npm run dev
+# Press S → 4 boxes render
+# Press V → tool executes → kitchen ledger updated
+```

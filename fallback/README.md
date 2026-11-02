@@ -208,3 +208,86 @@ worker unit tests: 9/9      proxy failover suite: 11/11
 
 Not yet done on this route: the in-browser HUD pass (the footer/telemetry proof was run against the
 local fixture, which exercises the same code path).
+
+
+---
+
+# Fallback Vision — Open-Weight Vision on Cloudflare Workers
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph PROXY["Proxy :8790"]
+        F_TIER{Fallback Router}
+        F_COOL[Cooldown 60s]
+        F_BUILD[Build Fallback Prompt
+{tools} + {example}]
+    end
+
+    subgraph CF["Cloudflare Worker"]
+        W_API[/v1/chat/completions/]
+        W_AI[Workers AI
+@cf/meta/llama-3.2-11b-vision-instruct]
+        W_KV[KV Rate Limit
+60 req/min]
+    end
+
+    PROXY -->|FALLBACK_MODE=auto| F_TIER
+    F_TIER -->|open-weights| F_BUILD
+    F_BUILD -->|OpenAI wire format| W_API
+    W_API --> W_AI
+    W_API --> W_KV
+    W_AI -->|tool JSON| W_API
+    W_API -->|tool JSON| PROXY
+    PROXY -->|Re-reserve + Refund| LEDGER[Spend Ledger]
+```
+
+## Deploy
+
+```bash
+cd fallback/worker
+# 1. Auth
+npx wrangler login
+
+# 2. Set secret (stdin)
+echo "sk-..." | npx wrangler secret put FALLBACK_API_KEY
+
+# 3. Deploy
+npx wrangler deploy
+# Creates https://linecheck-fallback.<subdomain>.workers.dev
+```
+
+## Test
+
+```bash
+# Health
+curl https://linecheck-fallback.zumayaaustin.workers.dev/health
+
+# Vision completion
+curl -X POST https://linecheck-fallback.zumayaaustin.workers.dev/v1/chat/completions   -H "Authorization: Bearer $FALLBACK_API_KEY"   -H "Content-Type: application/json"   -d '{
+    "model": "llama-3.2-11b-vision",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What kitchen containers do you see?"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+      ]
+    }],
+    "tools": [{"type": "function", "function": {"name": "record_waste", "parameters": {...}}}]
+  }'
+```
+
+## Rate Limit Headers
+
+```
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 59
+X-RateLimit-Reset: 1700000000
+```
+
+## Free Tier Limits
+
+- Workers: 100,000 requests/day
+- Workers AI: ~10,000 neurons/day (vision ≈ 0.6 neurons/call)
+- No credit card required for this tier
