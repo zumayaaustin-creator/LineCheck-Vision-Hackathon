@@ -194,8 +194,7 @@ flowchart LR
     RESET -->|clear| STORE
 ```
 
-Only the **voice chain** (V, M, wake word) writes to the ledger. The Shift+1-4 shortcuts run a
-tool on the HUD without logging it. The proxy accepts both the short names (`waste`, `yield`)
+Only the **voice chain** (V, M, wake word) writes to the ledger. The proxy accepts both the short names (`waste`, `yield`)
 and the WebMCP tool names the HUD actually sends (`record_waste`, `calculate_yield`).
 
 ---
@@ -316,18 +315,7 @@ On PowerShell, set `$env:UPSTREAM_BASE = "http://127.0.0.1:8787"` and
 - `GET /__usage` shows the spend ledger, `GET /__kitchen/state` the kitchen ledger.
 - `POST /__kitchen/reset` empties the kitchen ledger (do this before recording a clean take).
 
-### 5. Run the four kitchen tools directly
-
-These run a tool on the HUD without the voice chain, and **do not** write to the ledger:
-
-| Key | Tool |
-|-----|------|
-| `Shift+1` | `tare_scale {unit:"g"}` |
-| `Shift+2` | `calculate_yield {ap:2200, ep:1650, trim:550}` → 75% yield |
-| `Shift+3` | `verify_pan_depth {pan:"1/6 Pan", fill:15%}` → warning (fill < 20%) |
-| `Shift+4` | `record_waste {ingredient:"Pork Collar", weight:450, reason:"Heavy Silver Skin Trim"}` → ALERT |
-
-### 6. Exercise the real fetch path against the mock server
+### 5. Exercise the real fetch path against the mock server
 
 This leaves mock mode and sends real HTTP requests to the mock server, which returns generic
 (non-photo) boxes. With `node harness/mock-server.mjs` running, create `harness/webmcp/.env.local`:
@@ -347,7 +335,7 @@ Restart `npm run dev`. Press `S` → the HUD shows the mock server's detections:
 
 Press `V` → synthetic audio → mock Muse transcript → Spark tool pick → tool executes → ledger.
 
-### 7. Run Tests
+### 6. Run Tests
 ```bash
 cd harness/webmcp
 npm test
@@ -533,7 +521,6 @@ Out of the box it runs **entirely on local mocks** - no key, no credits, no netw
 | `C` | restart the camera capture |
 | `V` | one voice command (the next scripted line in mock mode, synthetic audio in live mode) |
 | `1` `2` `3` `4` | load demo photo 1-4 |
-| `Shift+1` … `Shift+4` | tare_scale · calculate_yield · verify_pan_depth · record_waste |
 | `T` | pin / unpin the ledger card |
 | `F` | cycle the model tier |
 | `0` | clear the HUD |

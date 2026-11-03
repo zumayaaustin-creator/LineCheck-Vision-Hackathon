@@ -458,18 +458,13 @@ recording cannot retrigger it.
 | `V` | one voice utterance -> resolves to a WebMCP tool -> executes it -> logs to the kitchen ledger. In mock mode it plays the next line of a 7-line script |
 | `M` | same as `V` but captures from the real microphone first |
 | `1` `2` `3` `4` | load demo photo 1-4 (clears the old reticles) |
-| `Shift+1` | `tare_scale` |
-| `Shift+2` | `calculate_yield` |
-| `Shift+3` | `verify_pan_depth` (15% -> warning) |
-| `Shift+4` | `record_waste` (-> ALERT) |
 | `T` | pin / unpin the kitchen ledger card (it also flashes for 8s on each new entry) |
 | `F` | cycle the model tier |
 | `C` | restart the camera capture |
 | `W` | toggle the wake word listener |
 | `0` | clear |
 
-The `Shift` shortcuts run a tool on the HUD only. Entries reach the kitchen ledger through the
-voice chain (`V`, `M`, wake word). The proxy's `/__kitchen/log` accepts both the short types
+Entries reach the kitchen ledger through the voice chain (`V`, `M`, wake word). The proxy's `/__kitchen/log` accepts both the short types
 (`waste`, `yield`, `tare`, `audit`) and the WebMCP tool names the HUD posts (`record_waste`,
 `calculate_yield`, `tare_scale`, `verify_pan_depth`).
 

@@ -69,19 +69,6 @@ curl -X POST http://127.0.0.1:8790/__kitchen/reset   # empty the kitchen ledger
 
 ---
 
-## The Four Kitchen Tools, Directly (Shift + 1–4)
-
-These run a tool on the HUD without the voice chain, and do not write to the ledger.
-
-| Key | Tool | What happens |
-|-----|------|--------------|
-| `Shift+1` | `tare_scale` | Sets the tare |
-| `Shift+2` | `calculate_yield` | 75% yield (2200 g → 1650 g) |
-| `Shift+3` | `verify_pan_depth` | 15% fill → **warning** reticle |
-| `Shift+4` | `record_waste` | 450 g Pork Collar → **ALERT** reticle |
-
----
-
 ## Exercise the Real Fetch Path (optional)
 
 This leaves mock mode and sends real HTTP requests to the mock server. With
