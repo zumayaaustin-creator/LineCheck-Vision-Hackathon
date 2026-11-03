@@ -44,18 +44,9 @@ class HUDStore {
   private state: HUDState = {
     status: 'IDLE',
     telemetry: { fps: 60, latencyMs: 12, apiCreditSpent: 0.0 },
-    reticles: [
-      {
-        id: 'initial-target',
-        x: 180,
-        y: 180,
-        width: 240,
-        height: 240,
-        label: 'HOTEL PAN 1/3 (SYS)',
-        confidence: 0.94,
-        status: 'nominal',
-      },
-    ],
+    // Start empty: a placeholder box cannot know what the frame shows, and would name something
+    // that is not there. Reticles appear only after S (snapshot) or a tool result.
+    reticles: [],
     audioLevel: 15,
     modelTier: 'primary',
     proxy: { modelId: '', cached: null, ledgerSpentUsd: null, lastError: null },

@@ -1,0 +1,22 @@
+{
+  "_comment": "Per-scene mock detections in 600x600 HUD space, keyed by demo scene slot. Each photo is letterboxed (contained, not stretched) into the canvas: scene 1 is 3:2 (y offset 100), scene 2 is 1:1 (no offset), scene 3 is 4:3 (y offset 75). Used only for demo-sourced scenes; dropped photos fall back to mockDetections.json.",
+  "1": [
+    { "id": "s1-jalapeno-a", "label": "1/6 PAN — JALAPENOS", "x": 33, "y": 226, "width": 130, "height": 135, "confidence": 0.93, "fillPercentage": 55, "status": "warning" },
+    { "id": "s1-jalapeno-b", "label": "1/6 PAN — JALAPENOS", "x": 21, "y": 350, "width": 136, "height": 138, "confidence": 0.95, "fillPercentage": 70, "status": "nominal" },
+    { "id": "s1-olives-a", "label": "1/6 PAN — BLACK OLIVES", "x": 203, "y": 208, "width": 143, "height": 132, "confidence": 0.92, "fillPercentage": 75, "status": "nominal" },
+    { "id": "s1-olives-b", "label": "1/6 PAN — BLACK OLIVES", "x": 197, "y": 342, "width": 153, "height": 141, "confidence": 0.94, "fillPercentage": 80, "status": "nominal" },
+    { "id": "s1-onion", "label": "1/6 PAN — DICED ONION", "x": 400, "y": 150, "width": 167, "height": 150, "confidence": 0.97, "fillPercentage": 95, "status": "breach" },
+    { "id": "s1-salsa", "label": "1/6 PAN — SALSA", "x": 403, "y": 317, "width": 177, "height": 155, "confidence": 0.96, "fillPercentage": 85, "status": "nominal" }
+  ],
+  "2": [
+    { "id": "s2-tritip-a", "label": "TRI-TIP A", "x": 2, "y": 69, "width": 219, "height": 495, "confidence": 0.94, "status": "nominal" },
+    { "id": "s2-tritip-b", "label": "TRI-TIP B", "x": 96, "y": 28, "width": 247, "height": 480, "confidence": 0.93, "status": "warning" },
+    { "id": "s2-tritip-c", "label": "TRI-TIP C", "x": 257, "y": 92, "width": 341, "height": 468, "confidence": 0.95, "status": "nominal" }
+  ],
+  "3": [
+    { "id": "s3-pork-roast", "label": "PORK ROAST", "x": 58, "y": 130, "width": 484, "height": 269, "confidence": 0.98, "status": "warning" }
+  ],
+  "4": [
+    { "id": "s4-hotel-pan-pulled-pork", "label": "1/2 PAN — PULLED PORK", "x": 13, "y": 151, "width": 576, "height": 307, "confidence": 0.98, "fillPercentage": 90, "status": "nominal" }
+  ]
+}

@@ -1,4 +1,5 @@
 import mockDetections from '../../mock-device-kit/mockDetections.json';
+import mockScenes from '../../mock-device-kit/mockScenes.json';
 import type { ContainerTarget } from '../types/hud';
 import { env, shouldUseMock, mockReason, HUD_SIZE } from '../config/env';
 import { normalizeToHud, type RawDetection, type SourceFrame } from './normalize';
@@ -57,10 +58,68 @@ export interface VoiceCommandResponse {
 /** Shape of the mock fixture: already in HUD space, so it is passed through unnormalised. */
 const MOCK_HUD_SPACE: SourceFrame = { width: HUD_SIZE, height: HUD_SIZE };
 
+/**
+ * Mock-mode voice script. Each press of V plays the next line, so the transcript, the tool the
+ * HUD runs, and the ledger row it writes all tell one consistent story about the demo photos.
+ * Loops after the last line. Mock mode only: live calls never read this.
+ */
+const MOCK_SCRIPT: Array<{
+  transcription: string;
+  assistantReply: string;
+  actionRequired: string;
+  toolCall: ToolCall;
+}> = [
+  {
+    transcription: 'Check prep level on the diced onion',
+    assistantReply: 'Diced onion at 95% in the 1/6 pan. Overfilled, pull some before it spills.',
+    actionRequired: 'NOTIFY_PREP',
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 95 } },
+  },
+  {
+    transcription: 'Log pork roast trim, four hundred fifty grams, fat cap',
+    assistantReply: 'Logged 450 grams of pork roast trim as fat cap waste.',
+    actionRequired: 'LOG_WASTE',
+    toolCall: { name: 'record_waste', arguments: { ingredient: 'Pork Roast', weight_g: 450, reason: 'Fat cap trim' } },
+  },
+  {
+    transcription: 'Check the jalapeno pan',
+    assistantReply: 'Jalapenos at 55% in the 1/6 pan. Fine for now.',
+    actionRequired: 'NOTIFY_PREP',
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 55 } },
+  },
+  {
+    transcription: 'Yield on the tri-tip, twenty-two hundred purchased, sixteen fifty edible',
+    assistantReply: 'Tri-tip yield is 75 percent: 1650 grams edible from 2200 purchased.',
+    actionRequired: 'LOG_YIELD',
+    toolCall: { name: 'calculate_yield', arguments: { ap_weight_g: 2200, ep_weight_g: 1650, trim_weight_g: 550 } },
+  },
+  {
+    transcription: 'Check the black olives',
+    assistantReply: 'Black olives at 80% in the 1/6 pan.',
+    actionRequired: 'NOTIFY_PREP',
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 80 } },
+  },
+  {
+    transcription: 'Log salsa waste, three hundred grams, expired',
+    assistantReply: 'Logged 300 grams of salsa as expired.',
+    actionRequired: 'LOG_WASTE',
+    toolCall: { name: 'record_waste', arguments: { ingredient: 'Salsa', weight_g: 300, reason: 'Expired' } },
+  },
+  {
+    transcription: 'Check the pulled pork half pan',
+    assistantReply: 'Pulled pork at 90% in the half pan. Full, hold it hot.',
+    actionRequired: 'NOTIFY_PREP',
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/2 Pan', fill_percentage: 90 } },
+  },
+];
+
 export class MetaModelClient {
   private inFlight = false;
   private lastCallAt = 0;
   private lastResponse: VisionResponse | null = null;
+  /** mock voice script position, and the tool the last scripted line resolves to */
+  private mockIndex = 0;
+  private pendingMockTool: ToolCall | null = null;
 
   /** source frame geometry the live model returns boxes in */
   private frame: SourceFrame = { width: env.sourceWidth, height: env.sourceHeight };
@@ -79,11 +138,17 @@ export class MetaModelClient {
   async analyzeFrame(
     imageDataBase64?: string,
     frame?: { width: number; height: number },
+    /** demo scene slot (1-4) when the frame is one of the bundled demo photos, else null */
+    sceneSlot?: number | null,
   ): Promise<VisionResponse> {
     if (shouldUseMock()) {
+      // a bundled demo photo has hand-placed boxes; anything else gets the generic fixture
+      const sceneBoxes = sceneSlot != null
+        ? (mockScenes as unknown as Record<string, RawDetection[]>)[String(sceneSlot)]
+        : undefined;
       return {
         source: 'local_mock_cache',
-        containers: normalizeToHud(mockDetections as RawDetection[], MOCK_HUD_SPACE),
+        containers: normalizeToHud(sceneBoxes ?? (mockDetections as RawDetection[]), MOCK_HUD_SPACE),
         mockReason: mockReason(),
       };
     }
@@ -94,36 +159,42 @@ export class MetaModelClient {
       return this.lastResponse ?? { source: 'live_meta_api', containers: [], throttled: true };
     }
     if (now - this.lastCallAt < env.minSnapshotIntervalMs) {
-      return this.lastResponse ?? { source: 'live_meta_api', containers: [], throttled: true };
-    }
+          return this.lastResponse ?? { source: 'live_meta_api', containers: [], throttled: true };
+        }
 
-    this.inFlight = true;
-    this.lastCallAt = now;
-    // a real captured frame carries its own dimensions; fall back to the configured frame
-    const sourceFrame = frame ?? this.frame;
-    try {
-      const response = await fetch(env.samEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // proxy mode: the proxy injects the credential, so none is sent from the browser
-          ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
-        },
-        body: JSON.stringify({ frame: imageDataBase64, width: sourceFrame.width, height: sourceFrame.height }),
-      });
+        this.inFlight = true;
+        this.lastCallAt = now;
+        // a real captured frame carries its own dimensions; fall back to the configured frame
+        const sourceFrame = frame ?? this.frame;
+        // Ensure the base64 image data does not include "data:image/jpeg;base64,"
+        const cleanBase64 = imageDataBase64 && imageDataBase64.includes(',')
+          ? imageDataBase64.split(',')[1]
+          : imageDataBase64;
+        try {
+          const response = await fetch(env.samEndpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              // proxy mode: the proxy injects the credential, so none is sent from the browser
+              ...(env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {}),
+            },
+            body: JSON.stringify({ frame: cleanBase64, width: sourceFrame.width, height: sourceFrame.height }),
+          });
 
-      if (!response.ok) {
-        throw new Error(`SAM 3.1 HTTP ${response.status}`);
+          if (!response.ok) {
+            // surface the upstream's own explanation: a bare status hides schema vs. credit errors
+            const detail = await response.text().catch(() => '');
+            throw new Error(`SAM 3.1 HTTP ${response.status}${detail ? `: ${detail.slice(0, 400)}` : ''}`);
+          }
+
+          const data = (await response.json()) as { detections?: RawDetection[] };
+          const containers = normalizeToHud(data.detections ?? [], sourceFrame);
+          this.lastResponse = { source: 'live_meta_api', containers };
+          return this.lastResponse;
+        } finally {
+          this.inFlight = false;
+        }
       }
-
-      const data = (await response.json()) as { detections?: RawDetection[] };
-      const containers = normalizeToHud(data.detections ?? [], sourceFrame);
-      this.lastResponse = { source: 'live_meta_api', containers };
-      return this.lastResponse;
-    } finally {
-      this.inFlight = false;
-    }
-  }
 
   /**
    * Muse Voice -> Muse Spark reasoning. Also gated: one shot per explicit wake event,
@@ -131,13 +202,11 @@ export class MetaModelClient {
    */
   async processKitchenQuery(audioBlob?: Blob, hint?: string): Promise<VoiceCommandResponse> {
     if (shouldUseMock()) {
-      return {
-        source: 'local_mock_cache',
-        transcription: 'Check prep level on diced shallots',
-        assistantReply: 'Shallots at 25% in station 2. Re-up needed before dinner service.',
-        actionRequired: 'NOTIFY_PREP',
-        toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 25 } },
-      };
+      const line = MOCK_SCRIPT[this.mockIndex % MOCK_SCRIPT.length];
+      this.mockIndex += 1;
+      // resolveTool() runs next in the chain and must pick THIS line's tool, not re-guess from words
+      this.pendingMockTool = line.toolCall;
+      return { source: 'local_mock_cache', ...line };
     }
 
     if (!audioBlob) {
@@ -157,7 +226,10 @@ export class MetaModelClient {
       headers: env.metaApiKey ? { Authorization: `Bearer ${env.metaApiKey}` } : {},
       body,
     });
-    if (!response.ok) throw new Error(`Muse HTTP ${response.status}`);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Muse HTTP ${response.status}${detail ? `: ${detail.slice(0, 400)}` : ''}`);
+    }
 
     const data = (await response.json()) as {
       transcription?: string;
@@ -200,13 +272,25 @@ export class MetaModelClient {
       if (/tare|zero|calibrat/.test(low)) {
         return { toolCall: { name: 'tare_scale', arguments: { unit: 'g' } }, confidence: 0.9 };
       }
-      return { toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '4-inch Hotel Pan', fill_percentage: 15 } }, confidence: 0.6 };
+      return { toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 25 } }, confidence: 0.6 };
     };
 
     const offline = (
       telemetry: ProxyTelemetry,
       refused: TierRefusal | null = null,
     ): ResolvedTool => ({ ...localFallback(), source: 'local_mock_cache', telemetry, refused });
+
+    if (shouldUseMock() && this.pendingMockTool) {
+      const scripted = this.pendingMockTool;
+      this.pendingMockTool = null;
+      return {
+        toolCall: scripted,
+        source: 'local_mock_cache',
+        confidence: 0.95,
+        telemetry: { modelTier: null, modelId: '', cached: null, ledgerSpentUsd: null, lastError: null },
+        refused: null,
+      };
+    }
 
     if (shouldUseMock() || !env.museSparkEndpoint) {
       return offline({

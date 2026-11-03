@@ -482,7 +482,8 @@ function applyKitchenLog(ledger, entry) {
   const newLedger = { ...ledger, parStock: { ...ledger.parStock } };
 
   switch (entry.type) {
-    case 'waste': {
+    case 'waste':
+    case 'record_waste': { // the HUD posts the WebMCP tool name as `type`
       const { ingredient, weight_g, reason } = entry;
       if (!ingredient || typeof weight_g !== 'number') break;
       // Auto-create ingredient if new
@@ -494,9 +495,14 @@ function applyKitchenLog(ledger, entry) {
       newLedger.wasteLog.push({ ...entry, timestamp: now });
       break;
     }
-    case 'yield': {
+    case 'yield':
+    case 'calculate_yield': {
       const { ingredient, ap_weight_g, ep_weight_g, trim_weight_g } = entry;
-      if (!ingredient) break;
+      if (!ingredient) {
+        // the calculate_yield tool carries no ingredient: keep the record, leave stock untouched
+        newLedger.yieldLog.push({ ...entry, timestamp: now });
+        break;
+      }
       // Auto-create ingredient if new
       if (!newLedger.parStock[ingredient]) {
         newLedger.parStock[ingredient] = { parGrams: 5000, currentGrams: 5000, unit: 'g' };
@@ -1238,6 +1244,8 @@ const server = createServer(async (req, res) => {
       log(`#${ledger.paidCalls} <- ${upstream.status} (${text.length}B)`);
 
       if (upstream.status < 200 || upstream.status >= 300) {
+        // show the exact upstream error body so schema/credit failures are diagnosable
+        log(`UPSTREAM ERROR ${url.pathname} ${upstream.status}: ${text.slice(0, 1000)}`);
         // refund: an outright rejection was almost certainly not billed
         refundAttempt(`upstream ${upstream.status}`);
         const outcome = handleFailure({

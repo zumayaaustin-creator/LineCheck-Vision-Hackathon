@@ -10,7 +10,8 @@ import { camera, cameraSupported } from './camera';
 import { WakeWord } from './wakeword';
 
 // ---- Photo Loader / Scene Slots ----
-const SCENE_STORAGE_KEY = 'linecheck-scenes';
+// v2: invalidates scenes cached by earlier builds so the bundled demo photos always load fresh
+const SCENE_STORAGE_KEY = 'linecheck-scenes-v2';
 const DEMO_FRAMES_DIR = '/demo-frames/';
 
 const canvas =
@@ -29,7 +30,16 @@ if (canvas) {
 // ---- Scene/Photo Loader State ----
 let loadedScenes: Map<number, { dataUrl: string; name: string; width: number; height: number; source: string; loadedAt: string }> = new Map();
 let activeScene: number | null = null;
-let telemetryPanelOpen = true;
+// Closed by default so the photo is unobstructed. T pins the ledger card open, and a freshly
+// saved entry flashes it for a few seconds (ledgerFlashUntil).
+let telemetryPanelOpen = false;
+interface KitchenState {
+  wasteLog?: Array<{ ingredient: string; weight_g: number; reason?: string; timestamp: string }>;
+  yieldLog?: Array<{ ap_weight_g?: number; ep_weight_g?: number; timestamp: string }>;
+  panDepthAudit?: Array<{ panType: string; fillPercentage: number; timestamp: string }>;
+}
+let kitchenState: KitchenState | null = null;
+let ledgerFlashUntil = 0;
 let customFrameDataUrl: string | null = null;
 let customFrameDims: { width: number; height: number } | null = null;
 let activeContainer: string | null = null;
@@ -71,6 +81,7 @@ setInterval(async () => {
     const resp = await fetch(`${PROXY_BASE}/__kitchen/state`);
     if (resp.ok) {
       const kitchen = await resp.json();
+      kitchenState = kitchen;
       activeContainer = kitchen.activeContainer || null;
       activeTareGrams = kitchen.activeTareGrams || 0;
     }
@@ -225,7 +236,7 @@ let lastFrameText = '';
 async function refreshBudget() {
   const u = await metaClient.getUsage();
   budgetText = u
-    ? `BUDGET: $${u.remainingUsd.toFixed(2)} left  (spent $${u.totalSpendUsd.toFixed(2)} / ${u.paidCalls} calls / ${u.cacheHits} cached)`
+    ? `BUDGET: $${(u.remainingUsd ?? 0).toFixed(2)} left  (spent $${(u.totalSpendUsd ?? 0).toFixed(2)} / ${u.paidCalls ?? 0} calls / ${u.cacheHits ?? 0} cached)`
     : '';
 }
 void refreshBudget();
@@ -250,14 +261,50 @@ const FOOTER_STRIP_GAP = 26;
 const FOOTER_STRIP_Y = HUD_SIZE - FOOTER_STRIP_GAP - FOOTER_STRIP_H;
 const WARNING_PILL_H = 18;
 
+/**
+ * Active scene photo, decoded once per source. Declared before the first draw for the same
+ * reason as the strip geometry above: render() runs at module scope.
+ */
+let sceneImg: HTMLImageElement | null = null;
+let sceneImgSrc: string | null = null;
+
+/**
+ * Draw the loaded photo "contained" inside the square canvas: the whole picture, aspect ratio
+ * preserved, dark bars on the short side. Never stretched or cropped, so reticle coordinates
+ * authored against a photo's contained position stay exact. Returns false if nothing was drawn.
+ */
+function drawSceneBackground(): boolean {
+  if (!ctx || !customFrameDataUrl || !customFrameDims) return false;
+  if (sceneImgSrc !== customFrameDataUrl) {
+    const src = customFrameDataUrl;
+    sceneImgSrc = src;
+    sceneImg = null;
+    const img = new Image();
+    img.onload = () => {
+      if (sceneImgSrc === src) sceneImg = img; // ignore a decode that lost a race with a scene switch
+    };
+    img.src = src;
+  }
+  if (!sceneImg) return false;
+  const { width: w, height: h } = customFrameDims;
+  const scale = Math.min(HUD_SIZE / w, HUD_SIZE / h);
+  const dw = w * scale;
+  const dh = h * scale;
+  ctx.fillStyle = '#050505';
+  ctx.fillRect(0, 0, HUD_SIZE, HUD_SIZE);
+  ctx.drawImage(sceneImg, (HUD_SIZE - dw) / 2, (HUD_SIZE - dh) / 2, dw, dh);
+  return true;
+}
+
 function drawFrame() {
   if (!ctx || !canvas) return;
   ctx.clearRect(0, 0, HUD_SIZE, HUD_SIZE);
 
   const state = hudStore.getState();
 
-  // live camera behind the reticles when one is running
-  if (camera.isLive) camera.drawBackground(ctx, HUD_SIZE, HUD_SIZE);
+  // A loaded scene photo wins over the camera, matching triggerSnapshot, which also prefers the
+  // custom frame. With no scene loaded, the live camera is drawn behind the reticles.
+  if (!drawSceneBackground() && camera.isLive) camera.drawBackground(ctx, HUD_SIZE, HUD_SIZE);
 
   // Status banner. The HTML header occupies canvas-space y 12-31, so this sits below it.
   ctx.font = '10px monospace';
@@ -317,7 +364,7 @@ function drawFrame() {
   drawTierWarning(state);
   
   // Draw telemetry panel if open
-  if (telemetryPanelOpen) {
+  if (telemetryPanelOpen || Date.now() < ledgerFlashUntil) {
     drawTelemetryPanel(hudStore.getState());
   }
 }
@@ -336,64 +383,68 @@ render();
  * under it, and clips itself, so nothing it draws can leave the canvas or cover the footer.
  */
 // ---- Telemetry Panel ----
+/** Newest-first rows for the ledger card, one per saved waste / yield / pan-depth entry. */
+function ledgerRows(k: KitchenState | null): Array<{ at: string; text: string; color: string }> {
+  if (!k) return [];
+  const rows: Array<{ at: string; text: string; color: string }> = [];
+  for (const w of k.wasteLog ?? []) {
+    rows.push({ at: w.timestamp, text: `WASTE  ${w.ingredient}  -${w.weight_g}g  ${w.reason ?? ''}`.trimEnd(), color: '#BD00FF' });
+  }
+  for (const y of k.yieldLog ?? []) {
+    const pct = y.ap_weight_g && y.ep_weight_g !== undefined ? ((y.ep_weight_g / y.ap_weight_g) * 100).toFixed(1) : '?';
+    rows.push({ at: y.timestamp, text: `YIELD  ${pct}%  EP ${y.ep_weight_g ?? '?'}g / AP ${y.ap_weight_g ?? '?'}g`, color: '#00F0FF' });
+  }
+  for (const p of k.panDepthAudit ?? []) {
+    const off = p.fillPercentage < 20 || p.fillPercentage > 90;
+    rows.push({ at: p.timestamp, text: `PAN    ${p.panType}  ${p.fillPercentage}%`, color: off ? '#FCEE0A' : '#00F0FF' });
+  }
+  return rows.sort((a, b) => (a.at < b.at ? 1 : -1));
+}
+
+/**
+ * Kitchen ledger card, drawn INSIDE the 600x600 frame (the old panel was drawn at x=610+, outside
+ * the canvas, so it never showed). Anchored above the telemetry strip; the latest four entries.
+ */
 function drawTelemetryPanel(_state: HUDState): void {
   if (!ctx) return;
+  const rows = ledgerRows(kitchenState);
+  const shown = rows.slice(0, 4);
+  const x = 12;
+  const w = HUD_SIZE - 24;
+  const rowH = 14;
+  const h = 26 + Math.max(1, shown.length) * rowH + 6;
+  const y = FOOTER_STRIP_Y - 6 - h;
 
-  // Panel background
-  ctx.fillStyle = '#050505';
-  ctx.fillRect(HUD_SIZE + 10, 0, 280, HUD_SIZE);
+  ctx.save();
+  ctx.fillStyle = 'rgba(5, 5, 5, 0.88)';
+  ctx.fillRect(x, y, w, h);
   ctx.strokeStyle = '#00F0FF';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(HUD_SIZE + 10, 0, 280, HUD_SIZE);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
 
-  let y = 16;
+  // keep every string inside the card
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
 
-  // Title
-  ctx.font = 'bold 14px monospace';
-  ctx.fillStyle = '#00F0FF';
-  ctx.fillText('KITCHEN OPS LEDGER', HUD_SIZE + 22, y);
-  y += 26;
-
-  // Inventory
-  ctx.font = 'bold 12px monospace';
+  ctx.font = 'bold 11px monospace';
   ctx.fillStyle = '#FCEE0A';
-  ctx.fillText('INVENTORY', HUD_SIZE + 22, y);
-  y += 22;
+  ctx.fillText(`KITCHEN LEDGER  ${rows.length} entr${rows.length === 1 ? 'y' : 'ies'}`, x + 8, y + 15);
+  ctx.font = '10px monospace';
+  ctx.fillStyle = '#7ad';
+  const scale = `${activeContainer ?? 'no container'}  tare ${activeTareGrams}g`;
+  ctx.fillText(scale, x + w - 8 - ctx.measureText(scale).width, y + 15);
 
-  // We'll fetch kitchen state synchronously from cached data
-  // The polling interval updates activeContainer/activeTareGrams
-  // For now, show a placeholder
   ctx.font = '11px monospace';
-  ctx.fillStyle = '#555555';
-  ctx.fillText('(polling /__kitchen/state...)', HUD_SIZE + 22, y);
-  y += 20;
-
-  y += 8;
-  // Active Scale / Tare
-  ctx.font = 'bold 12px monospace';
-  ctx.fillStyle = '#FCEE0A';
-  ctx.fillText('SCALE', HUD_SIZE + 22, y);
-  y += 22;
-  ctx.font = '11px monospace';
-  ctx.fillStyle = '#00F0FF';
-  ctx.fillText(`Active: ${activeContainer || 'none'}`, HUD_SIZE + 22, y);
-  y += 16;
-  ctx.fillText(`Tare: ${activeTareGrams}g`, HUD_SIZE + 22, y);
-  y += 24;
-
-  // Ledger Save Status
-  ctx.font = 'bold 12px monospace';
-  ctx.fillStyle = '#FCEE0A';
-  ctx.fillText('LEDGER', HUD_SIZE + 22, y);
-  y += 22;
-  ctx.font = '11px monospace';
-  ctx.fillStyle = '#00F0FF';
-  ctx.fillText('Auto-save: ON', HUD_SIZE + 22, y);
-  y += 16;
-  ctx.fillStyle = '#555555';
-  ctx.fillText('File: .cache/kitchen-ops-ledger.json', HUD_SIZE + 22, y);
-  y += 16;
-  ctx.fillText('Auto-save: every change', HUD_SIZE + 22, y);
+  if (shown.length === 0) {
+    ctx.fillStyle = '#6a7a80';
+    ctx.fillText('No entries yet. Press V to log one.', x + 8, y + 26 + rowH - 3);
+  }
+  shown.forEach((r, i) => {
+    ctx.fillStyle = r.color;
+    ctx.fillText(r.text, x + 8, y + 26 + (i + 1) * rowH - 3);
+  });
+  ctx.restore();
 }
 
 function drawTelemetryFooter(state: HUDState): void {
@@ -522,10 +573,16 @@ async function triggerSnapshot() {
     if (frame.reason) console.log(`[HUD] frame fallback: ${frame.reason}`);
     console.log(`[HUD] snapshot frame: ${frame.source} ${frame.width}x${frame.height}`);
 
-    const result = await metaClient.analyzeFrame(frame.dataUrl, {
-      width: frame.width,
-      height: frame.height,
-    });
+    // only the bundled demo photos have hand-placed boxes; a dropped photo must not borrow them
+    const demoSlot =
+      activeScene !== null && customFrameDataUrl && loadedScenes.get(activeScene)?.source === 'demo'
+        ? activeScene
+        : null;
+    const result = await metaClient.analyzeFrame(
+      frame.dataUrl,
+      { width: frame.width, height: frame.height },
+      demoSlot,
+    );
     const breach = result.containers.some((c) => c.status === 'breach');
     const warn = result.containers.some((c) => c.status === 'warning');
 
@@ -597,7 +654,7 @@ async function triggerVoice(hint?: string) {
     
     // Log to kitchen ledger via proxy
     try {
-      await fetch(`${PROXY_BASE}/__kitchen/log`, {
+      const logResp = await fetch(`${PROXY_BASE}/__kitchen/log`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -605,6 +662,12 @@ async function triggerVoice(hint?: string) {
           ...picked.toolCall.arguments,
         }),
       });
+      if (logResp.ok) {
+        // the proxy answers with the saved ledger: show the new entry now, not on the next poll
+        const saved = (await logResp.json()) as { state?: KitchenState };
+        if (saved.state) kitchenState = saved.state;
+        ledgerFlashUntil = Date.now() + 8000;
+      }
     } catch (err) {
       console.warn('[HUD] Failed to log to kitchen ledger:', err);
     }
@@ -737,6 +800,9 @@ window.addEventListener('keydown', async (e) => {
     case '3':
     case '4':
       await loadScene(parseInt(e.key));
+      // boxes belong to the previous photo; clear them so a new scene starts clean (press S)
+      hudStore.setReticles([]);
+      hudStore.setStatus('IDLE');
       break;
     case 't':
     case 'T':
