@@ -29,12 +29,9 @@ coloured by urgency. Voice drives the same four actions the touch UI would.
 | "log 2 pounds of salmon trim waste" | `record_waste` - flags the trim zone, logs 907 g as loss |
 | "calculate yield on 15 pounds whole chicken down to 10.5 pounds" | `calculate_yield` - 70%, drawn on the HUD |
 | "tare scale for deep half pan" | `tare_scale` - zeroes the readout, draws a calibration box |
-| "verify pan depth 4-inch hotel pan" | `verify_pan_depth` - warns when fill is out of the 20-90% band |
+| "check the jalapeno pan" (a 1/6 pan at 55%) | `verify_pan_depth` - warns when fill is out of the 20-90% band |
 
 ---
-
-## Architecture
-
 
 ## Architecture Diagram
 
@@ -42,20 +39,24 @@ coloured by urgency. Voice drives the same four actions the touch UI would.
 flowchart TD
     subgraph HUD["600×600 HUD (harness/webmcp)"]
         direction TB
+        PHOTO["Demo photos 1-4<br/>public/demo-frames"] --> CANVAS
         CAM[Camera 1280×720] --> SNAP[Snapshot Trigger S/M]
+        PHOTO --> SNAP
         MIC[Microphone 2.2s] --> VOICE[Voice Trigger V/W]
         SNAP --> META[MetaModelClient]
         VOICE --> META
-        META --> SAM[SAM 3.1 Segment]
-        META --> MUSE[Muse Audio Transcribe]
-        META --> SPARK[Muse Spark Dispatch]
+        META -->|mock mode, default| MOCK["Mock replay<br/>mockScenes.json boxes per photo<br/>7-line voice script"]
+        META -->|live mode| SAM[SAM 3.1 Segment]
+        META -->|live mode| MUSE[Muse Audio Transcribe]
         SAM --> NORM[normalizeToHud 1280×720 → 600×600]
-        MUSE --> SPARK
+        MUSE --> SPARK[Muse Spark Dispatch]
+        MOCK --> STORE[HUDStore]
+        MOCK --> TOOLS
         SPARK --> TOOLS[executeTool 4 tools]
-        NORM --> STORE[HUDStore]
+        NORM --> STORE
         TOOLS --> STORE
         STORE --> CANVAS[Canvas Render Loop]
-        CANVAS --> RET[Reticles + Status Bar]
+        CANVAS --> RET["Photo background + Reticles<br/>+ Status Bar + Ledger card"]
     end
 
     subgraph PROXY["Proxy Server (harness/proxy-server.mjs)"]
@@ -74,9 +75,9 @@ flowchart TD
 
     subgraph KITCHEN["Kitchen Operations Ledger"]
         direction TB
-        TOOLS -->|POST /__kitchen/log| KPROXY[Proxy]
+        TOOLS -->|"POST /__kitchen/log (voice chain)"| KPROXY[Proxy]
         KPROXY --> KFILE[(.cache/kitchen-ops-ledger.json)]
-        KFILE --> PANEL[Telemetry Panel]
+        KPROXY -->|saved state in the response| CARD["Ledger card inside the HUD<br/>T pins it, flashes 8s on a new entry"]
     end
 
     subgraph FALLBACK_SVC["Fallback Vision (fallback/)"]
@@ -87,11 +88,15 @@ flowchart TD
 
     CAM -.->|frames| META
     MIC -.->|audio| META
-    SNAP -.->|base64| PROXY_API
-    VOICE -.->|multipart| PROXY_API
+    SNAP -.->|"base64 (live mode only)"| PROXY_API
+    VOICE -.->|"multipart (live mode only)"| PROXY_API
     PROXY_API -.->|OpenAI wire| META_API
     PROXY_API -.->|OpenAI wire| FALLBACK
 ```
+
+In **mock mode** (the default) nothing leaves the browser except the kitchen-ledger POST: the
+reticles come from `mock-device-kit/mockScenes.json` and the voice lines from a scripted list in
+`src/mcp/client.ts`. The proxy and fallback boxes only matter in live mode.
 
 ---
 
@@ -105,33 +110,45 @@ sequenceDiagram
     participant M as Meta API / Cloudflare Worker
     participant K as Kitchen Ledger
 
+    Note over U,H: Press 1-4 (load a demo photo)
+    H->>H: Draw photo letterboxed, clear old reticles
+
     Note over U,H: Press S (Snapshot)
-    H->>H: Capture camera frame 1280×720
-    H->>P: POST /sam-3.1/segment {frame, w, h}
-    P->>P: Budget check (3 ceilings)
-    P->>P: Cache lookup (SHA-256)
-    alt Cache hit
-        P-->>H: Cached detections $0.00
-    else Cache miss
-        P->>M: Forward to Meta/Worker
-        M-->>P: Detections 1280×720
-        P->>P: Reserve cost, reconcile
-        P-->>H: Fresh detections
+    alt Mock mode (default)
+        H->>H: Look up the photo's boxes in mockScenes.json (no network)
+    else Live mode
+        H->>H: Capture camera frame 1280×720
+        H->>P: POST /sam-3.1/segment {frame, w, h}
+        P->>P: Budget check (3 ceilings)
+        P->>P: Cache lookup (SHA-256)
+        alt Cache hit
+            P-->>H: Cached detections $0.00
+        else Cache miss
+            P->>M: Forward to Meta/Worker
+            M-->>P: Detections 1280×720
+            P->>P: Reserve cost, reconcile
+            P-->>H: Fresh detections
+        end
+        H->>H: normalizeToHud() → 600×600
     end
-    H->>H: normalizeToHud() → 600×600
     H->>H: Render reticles + status
 
     Note over U,H: Press V (Voice)
-    H->>H: Capture 2.2s audio
-    H->>P: POST /muse-audio/transcribe (multipart)
-    P->>M: Transcribe
-    M-->>P: Transcript
-    H->>P: POST /muse-spark/dispatch {transcript, tools}
-    P->>M: Spark tool selection
-    M-->>P: Tool call {name, args}
+    alt Mock mode (default)
+        H->>H: Next line of the 7-line script (transcript + tool call)
+    else Live mode
+        H->>H: Capture 2.2s audio
+        H->>P: POST /muse-audio/transcribe (multipart)
+        P->>M: Transcribe
+        M-->>P: Transcript
+        H->>P: POST /muse-spark/dispatch {transcript, tools}
+        P->>M: Spark tool selection
+        M-->>P: Tool call {name, args}
+    end
     H->>H: executeTool()
     H->>K: POST /__kitchen/log {type, ...}
-    K-->>H: Updated state
+    K-->>H: Saved ledger state
+    H->>H: Flash the ledger card for 8s
 ```
 
 ---
@@ -154,23 +171,93 @@ flowchart LR
     end
 
     subgraph STORE["Kitchen Ledger Store"]
-        PAR[(parStock: {ingredient: {parG, currG}})]
-        WASTE[(wasteLog[])]
-        YIELD[(yieldLog[])]
-        TARE[(activeContainer, activeTareG)]
-        AUDIT[(panDepthAudit[])]
+        PAR[("parStock: per-ingredient parG and currG")]
+        WASTE[("wasteLog[]")]
+        YIELD[("yieldLog[]")]
+        TARE[("activeContainer, activeTareG")]
+        AUDIT[("panDepthAudit[]")]
     end
 
-    TOOLS --> LOG
+    CARD["Ledger card in the HUD<br/>newest 4 entries, T to pin"]
+
+    T1 --> LOG
+    T2 --> LOG
+    T3 --> LOG
+    T4 --> LOG
     LOG -->|mutate| PAR
-    LOG -->|append| WASTE
-    LOG -->|append| YIELD
-    LOG -->|update| TARE
-    LOG -->|append| AUDIT
-    STATE -->|read| PAR
-    RESET -->|clear| PAR
-    PAR -->|poll 5s| PANEL[Telemetry Panel T]
+    LOG -->|"append (record_waste)"| WASTE
+    LOG -->|"append (calculate_yield)"| YIELD
+    LOG -->|"update (tare_scale)"| TARE
+    LOG -->|"append (verify_pan_depth)"| AUDIT
+    LOG -->|"saved state in the response"| CARD
+    STATE -->|"poll every 5s"| CARD
+    RESET -->|clear| STORE
 ```
+
+Only the **voice chain** (V, M, wake word) writes to the ledger. The Shift+1-4 shortcuts run a
+tool on the HUD without logging it. The proxy accepts both the short names (`waste`, `yield`)
+and the WebMCP tool names the HUD actually sends (`record_waste`, `calculate_yield`).
+
+---
+
+## Demo scenes (mock mode)
+
+In mock mode the HUD can sit on one of four real kitchen photos instead of a camera feed. The
+photo is drawn **letterboxed** (the whole picture, aspect ratio kept, dark bars on the short
+side) inside the 600×600 canvas, and pressing **S** draws that photo's reticles from
+`harness/webmcp/mock-device-kit/mockScenes.json`.
+
+| Key | Photo | What `S` draws |
+|---|---|---|
+| `1` | Six prep containers on a steel table (3:2) | Six `1/6 PAN` reticles: jalapenos ×2, black olives ×2, diced onion, salsa. One jalapeno pan warns, the onion pan breaches |
+| `2` | Seasoned tri-tip on a sheet pan (1:1) | `TRI-TIP A / B / C`, B warns |
+| `3` | Pork roast on a cutting board (4:3) | `PORK ROAST`, warns |
+| `4` | Pulled pork in a half pan (16:9) | `1/2 PAN — PULLED PORK`, 90% fill |
+
+How it behaves:
+
+- The HUD opens on scene 1 with **no reticles**. Press `S` to have it "find" things.
+- Switching scenes (`1`-`4`) clears the previous photo's reticles.
+- Only the bundled demo photos use these boxes. An image you drag onto the HUD gets the generic
+  `mockDetections.json` boxes instead, which will not line up with it.
+- A loaded photo is drawn behind the reticles in preference to the live camera.
+
+**Photos.** They live in `harness/webmcp/public/demo-frames/` as `scene-1.jpg` … `scene-4.jpg`.
+If a file is missing, that slot falls back to the camera (or a synthetic frame) and the generic
+boxes.
+
+**Adding or changing a photo.** Boxes are in 600×600 HUD space *after* letterboxing. For an image
+of `w × h` pixels with a box at `(x, y, bw, bh)` in image pixels:
+
+```
+s        = 600 / max(w, h)
+canvasX  = x * s + (600 - w * s) / 2
+canvasY  = y * s + (600 - h * s) / 2
+canvasW  = bw * s        canvasH = bh * s
+```
+
+### Voice script (mock mode)
+
+Each press of `V` plays the next line, so the transcript, the tool the HUD runs and the ledger
+row all agree. It loops after the seventh line and restarts on a page refresh.
+
+| # | Transcript | Tool | Ledger row |
+|---|---|---|---|
+| 1 | "Check prep level on the diced onion" | `verify_pan_depth` 1/6 Pan, 95% | `PAN 1/6 Pan 95%` |
+| 2 | "Log pork roast trim, four hundred fifty grams, fat cap" | `record_waste` Pork Roast, 450 g | `WASTE Pork Roast -450g Fat cap trim` |
+| 3 | "Check the jalapeno pan" | `verify_pan_depth` 1/6 Pan, 55% | `PAN 1/6 Pan 55%` |
+| 4 | "Yield on the tri-tip, twenty-two hundred purchased, sixteen fifty edible" | `calculate_yield` 2200 / 1650 | `YIELD 75.0% EP 1650g / AP 2200g` |
+| 5 | "Check the black olives" | `verify_pan_depth` 1/6 Pan, 80% | `PAN 1/6 Pan 80%` |
+| 6 | "Log salsa waste, three hundred grams, expired" | `record_waste` Salsa, 300 g | `WASTE Salsa -300g Expired` |
+| 7 | "Check the pulled pork half pan" | `verify_pan_depth` 1/2 Pan, 90% | `PAN 1/2 Pan 90%` |
+
+### Ledger card
+
+Press `T` to pin the **ledger card** open or closed. It sits inside the HUD, above the footer
+strip, and lists the newest four entries (`WASTE`, `YIELD`, `PAN`) with the entry count and the
+scale tare in its header. It also appears on its own for about 8 seconds whenever a new entry is
+saved. The full ledger is at `http://127.0.0.1:8790/__kitchen/state` and on disk in
+`.cache/kitchen-ops-ledger.json`.
 
 ---
 
@@ -191,56 +278,83 @@ npm install
 ```bash
 npm run dev
 # Opens http://localhost:5173
-# HUD shows: SAM 3.1: MOCK (default)
+# The HUD footer reads: SAM 3.1: MOCK (VITE_USE_MOCK_META)
 ```
 
-### 3. Test the Four Kitchen Actions
+### 3. Drive the demo
 
-| Key | Action | Mock Result |
-|-----|--------|-------------|
-| `1` | `tare_scale {unit:"g"}` | Sets active tare, no visual change |
-| `2` | `calculate_yield {ap:2200, ep:1650, trim:550}` | 75% yield logged |
-| `3` | `verify_pan_depth {pan:"1/6 Pan", fill:15%}` | Warning reticle (fill < 20%) |
-| `4` | `record_waste {ingredient:"Pork Collar", weight:450, reason:"Silver Skin"}` | ALERT reticle, waste logged |
+| Key | Action |
+|-----|--------|
+| `1` `2` `3` `4` | load demo photo 1-4 (clears the old reticles) |
+| `S` | snapshot: draw the loaded photo's reticles |
+| `V` | one voice command: plays the next line of the voice script |
+| `M` | capture the real microphone (synthetic if no device), then run the voice chain |
+| `W` | toggle the hands-free wake word ("line check") |
+| `T` | pin / unpin the ledger card |
+| `C` | restart the camera capture |
+| `F` | cycle the model tier |
+| `0` | clear the HUD |
 
-Press `T` to open the **Telemetry Panel** — shows live inventory, waste/yield log, tare, ledger status.
+### 4. Turn on the kitchen ledger (optional, two terminals)
 
-### 4. Test Snapshot (SAM 3.1)
+In mock mode the reticles and voice need no server. The ledger does: `V` posts each entry to
+the proxy. Run both from the **repository root**, because the proxy reads
+`harness/webmcp/tools.json` and writes `.cache/` relative to where it starts.
+
 ```bash
-# In another terminal
+# terminal 1: local mock upstream (http://127.0.0.1:8787)
 node harness/mock-server.mjs
-# Creates http://127.0.0.1:8787
 
-# Create harness/webmcp/.env.local:
+# terminal 2: the proxy (http://127.0.0.1:8790)
+UPSTREAM_BASE=http://127.0.0.1:8787 META_API_KEY=local-test-token node harness/proxy-server.mjs
+```
+
+On PowerShell, set `$env:UPSTREAM_BASE = "http://127.0.0.1:8787"` and
+`$env:META_API_KEY = "local-test-token"` before `node harness/proxy-server.mjs`.
+`local-test-token` is a throwaway string the mock server checks, not a real credential.
+
+- `GET /__usage` shows the spend ledger, `GET /__kitchen/state` the kitchen ledger.
+- `POST /__kitchen/reset` empties the kitchen ledger (do this before recording a clean take).
+
+### 5. Run the four kitchen tools directly
+
+These run a tool on the HUD without the voice chain, and **do not** write to the ledger:
+
+| Key | Tool |
+|-----|------|
+| `Shift+1` | `tare_scale {unit:"g"}` |
+| `Shift+2` | `calculate_yield {ap:2200, ep:1650, trim:550}` → 75% yield |
+| `Shift+3` | `verify_pan_depth {pan:"1/6 Pan", fill:15%}` → warning (fill < 20%) |
+| `Shift+4` | `record_waste {ingredient:"Pork Collar", weight:450, reason:"Heavy Silver Skin Trim"}` → ALERT |
+
+### 6. Exercise the real fetch path against the mock server
+
+This leaves mock mode and sends real HTTP requests to the mock server, which returns generic
+(non-photo) boxes. With `node harness/mock-server.mjs` running, create `harness/webmcp/.env.local`:
+
+```
 VITE_USE_MOCK_META=false
 VITE_META_API_KEY=local-test-token
 VITE_SAM_MODEL_ENDPOINT=http://127.0.0.1:8787/sam-3.1/segment
 VITE_MUSE_AUDIO_ENDPOINT=http://127.0.0.1:8787/muse-audio/transcribe
 ```
 
-Restart `npm run dev`. Press `S` → HUD shows live detections from mock server:
+Restart `npm run dev`. Press `S` → the HUD shows the mock server's detections:
 - 1/3 Hotel Pan (68% fill, nominal)
 - Salmon Trim Zone (12% fill, **warning**)
 - Scale Tare Zone (55% fill)
 - Overflow Probe (clamped to canvas edge)
 
-### 5. Test Voice Chain
-Press `V` → synthetic audio → mock Muse transcript → Spark tool pick → tool executes → kitchen ledger updated.
-
-Press `M` for real microphone (falls back to synthetic if no device/permission).
-
-### 6. Run Proxy with Budget Enforcement
-```bash
-cd harness
-META_API_KEY=local-test-token UPSTREAM_BASE=http://127.0.0.1:8787 node proxy-server.mjs
-# Starts http://127.0.0.1:8790
-# GET /__usage shows spend ledger
-```
+Press `V` → synthetic audio → mock Muse transcript → Spark tool pick → tool executes → ledger.
 
 ### 7. Run Tests
 ```bash
-cd harness
-node --test tests/proxy-fallback.test.mjs
+cd harness/webmcp
+npm test
+# 50 assertions: coordinates, wake word, tiers, tool dispatch
+
+cd ../..
+node --test harness/tests/proxy-fallback.test.mjs
 # 11/11 pass: failover, budget, circuit breaker, tier routing
 ```
 
@@ -413,12 +527,15 @@ Out of the box it runs **entirely on local mocks** - no key, no credits, no netw
 
 | key | action |
 |---|---|
-| `S` | one SAM 3.1 snapshot |
-| `M` | hold a 2.2s microphone capture, then send to Muse |
+| `S` | one snapshot (SAM 3.1 in live mode, the photo's mock boxes in mock mode) |
+| `M` | hold a 2.2s microphone capture, then run the voice chain |
 | `W` | toggle the hands-free wake word |
 | `C` | restart the camera capture |
-| `V` | one Muse utterance using synthetic audio |
-| `1` `2` `3` `4` | tare_scale · calculate_yield · verify_pan_depth · record_waste |
+| `V` | one voice command (the next scripted line in mock mode, synthetic audio in live mode) |
+| `1` `2` `3` `4` | load demo photo 1-4 |
+| `Shift+1` … `Shift+4` | tare_scale · calculate_yield · verify_pan_depth · record_waste |
+| `T` | pin / unpin the ledger card |
+| `F` | cycle the model tier |
 | `0` | clear the HUD |
 
 ### Going live without spending anything
@@ -445,6 +562,9 @@ exercised for free. `harness/proxy-server.mjs` keeps the credential server-side.
 | Content-addressed replay cache | **working** - pay once per unique frame/command |
 | Real camera capture | **working** - 1280x720 with synthetic fallback |
 | Wake word ("line check") | **working** - speech recognition, VAD fallback, $0.00 |
+| Demo photo scenes (1-4) with per-photo reticles | **working** - mock mode, boxes in `mockScenes.json` |
+| Scripted 7-line voice demo | **working** - mock mode, transcript, tool and ledger row agree |
+| Kitchen ledger card inside the HUD | **working** - `T` pins it, flashes on each new entry |
 | Live Meta SAM 3.1 / Muse calls | **not yet** - contract shapes settled, real endpoints not wired |
 
 The live branch has only ever spoken to the local mock. It has never contacted Meta, and no real
@@ -472,6 +592,9 @@ harness/webmcp/src/mcp/normalize.ts 1280x720 -> 600x600 with clamping
 harness/webmcp/src/mcp/tools.ts     the four WebMCP tools + dispatch
 harness/webmcp/src/mcp/client.ts    MetaModelClient, mock and live branches
 harness/webmcp/src/mic.ts           bounded microphone capture
+harness/webmcp/mock-device-kit/mockScenes.json     per-photo reticles (600x600, letterboxed)
+harness/webmcp/mock-device-kit/mockDetections.json generic fallback reticles
+harness/webmcp/public/demo-frames/  scene-1.jpg ... scene-4.jpg demo photos
 ```
 
 ---

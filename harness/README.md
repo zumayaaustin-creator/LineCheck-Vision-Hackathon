@@ -454,16 +454,24 @@ recording cannot retrigger it.
 
 | key | action |
 |---|---|
-| `S` | one SAM 3.1 snapshot (mock or live, depending on `VITE_USE_MOCK_META`) |
-| `V` | one Muse voice utterance -> resolves to a WebMCP tool -> executes it |
+| `S` | one SAM 3.1 snapshot (mock or live, depending on `VITE_USE_MOCK_META`). In mock mode it draws the loaded demo photo's boxes from `mockScenes.json` |
+| `V` | one voice utterance -> resolves to a WebMCP tool -> executes it -> logs to the kitchen ledger. In mock mode it plays the next line of a 7-line script |
 | `M` | same as `V` but captures from the real microphone first |
-| `1` | `tare_scale` |
-| `2` | `calculate_yield` |
-| `3` | `verify_pan_depth` (15% -> warning) |
-| `4` | `record_waste` (-> ALERT) |
+| `1` `2` `3` `4` | load demo photo 1-4 (clears the old reticles) |
+| `Shift+1` | `tare_scale` |
+| `Shift+2` | `calculate_yield` |
+| `Shift+3` | `verify_pan_depth` (15% -> warning) |
+| `Shift+4` | `record_waste` (-> ALERT) |
+| `T` | pin / unpin the kitchen ledger card (it also flashes for 8s on each new entry) |
+| `F` | cycle the model tier |
 | `C` | restart the camera capture |
 | `W` | toggle the wake word listener |
 | `0` | clear |
+
+The `Shift` shortcuts run a tool on the HUD only. Entries reach the kitchen ledger through the
+voice chain (`V`, `M`, wake word). The proxy's `/__kitchen/log` accepts both the short types
+(`waste`, `yield`, `tare`, `audit`) and the WebMCP tool names the HUD posts (`record_waste`,
+`calculate_yield`, `tare_scale`, `verify_pan_depth`).
 
 Both `S` and `V` are guarded by an in-flight flag plus a debounce, and the client adds its own
 `VITE_SNAPSHOT_MIN_INTERVAL_MS` floor - so neither can be driven from an animation frame even
@@ -500,37 +508,35 @@ is $0.00. The Spark adapter is the one path that is ready for a live key.
 ```mermaid
 flowchart TD
     subgraph MOCK["Mock Server :8787"]
-        M_SAM[/sam-3.1/segment/]
-        M_MUSE[/muse-audio/transcribe/]
-        M_SIM[/__simulate/]
+        M_SAM["/sam-3.1/segment"]
+        M_MUSE["/muse-audio/transcribe"]
+        M_SIM["/__simulate"]
     end
 
     subgraph PROXY["Proxy Server :8790"]
-        P_SAM[/sam-3.1/segment/]
-        P_MUSE[/muse-audio/transcribe/]
-        P_SPARK[/muse-spark/dispatch/]
-        P_USAGE[/__usage/]
-        P_KITCHEN[/__kitchen/state|log|reset/]
-        P_BUDGET[Budget Gates
-MAX_PAID_CALLS / MAX_SPEND_USD / MAX_SESSION]
-        P_CACHE[Replay Cache
-SHA-256(route+body)]
-        P_TIER{Tier Router
-primary / open-weights}
-        P_FALLBACK[Failover Logic
-status,timeout,network]
+        P_SAM["/sam-3.1/segment"]
+        P_MUSE["/muse-audio/transcribe"]
+        P_SPARK["/muse-spark/dispatch"]
+        P_USAGE["/__usage"]
+        P_KITCHEN["/__kitchen/state, log, reset"]
+        P_BUDGET["Budget Gates<br/>MAX_PAID_CALLS / MAX_SPEND_USD / MAX_SESSION"]
+        P_CACHE["Replay Cache<br/>SHA-256(route+body)"]
+        P_TIER{"Tier Router<br/>primary / open-weights"}
+        P_FALLBACK["Failover Logic<br/>status, timeout, network"]
     end
 
     subgraph UPSTREAM["Upstream APIs"]
-        META[Meta Model API
-SAM 3.1 / Muse / Spark]
-        CF[Cloudflare Worker
-Llama 3.2 Vision]
+        META["Meta Model API<br/>SAM 3.1 / Muse / Spark"]
+        CF["Cloudflare Worker<br/>Llama 3.2 Vision"]
     end
 
-    HUD[HUD Browser] -->|VITE_USE_PROXY=true| PROXY
-    HUD -.->|VITE_USE_PROXY=false
-VITE_*_ENDPOINT| MOCK
+    HUD[HUD Browser]
+    HUDMOCK["In-browser mock replay<br/>mockScenes.json + voice script"]
+
+    HUD -->|"VITE_USE_MOCK_META=true (default), no network"| HUDMOCK
+    HUD -->|VITE_USE_PROXY=true| PROXY
+    HUD -.->|"VITE_USE_PROXY=false<br/>VITE_*_ENDPOINT"| MOCK
+    HUD -->|"voice chain: POST /__kitchen/log"| P_KITCHEN
     PROXY -->|Budget check FIRST| P_BUDGET
     P_BUDGET -->|Reserve cost| P_CACHE
     P_CACHE -->|Miss| P_TIER
@@ -550,6 +556,7 @@ sequenceDiagram
     participant M as Mock/Upstream
 
     Note over H: User presses V (Voice)
+    Note over H: Mock mode: the next scripted line is used, no network
     H->>P: POST /muse-audio/transcribe (multipart audio)
     P->>M: Forward
     M-->>P: {transcription, tool}
@@ -559,6 +566,7 @@ sequenceDiagram
     H->>H: executeTool(name, args)
     H->>P: POST /__kitchen/log {type, ...}
     P->>P: Mutate parStock / append logs
+    P-->>H: {ok, state} (HUD flashes the ledger card)
 ```
 
 ## Budget & Cache Flow

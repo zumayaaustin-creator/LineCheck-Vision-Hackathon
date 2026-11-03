@@ -10,41 +10,83 @@ cd LineCheck-Vision-Hackathon/harness/webmcp
 npm install && npm run dev
 ```
 
-Open **http://localhost:5173** — you see a 600×600 cyber-dark HUD.
+Open **http://localhost:5173** — you see a 600×600 cyber-dark HUD on a kitchen photo. The footer
+reads `SAM 3.1: MOCK (VITE_USE_MOCK_META)`: this is a recorded-response demo, labelled as such.
 
 ---
 
-## Test the Four Kitchen Actions (keys 1–4)
+## Drive the Demo
 
-| Key | Tool | What Happens |
-|-----|------|--------------|
-| `1` | `tare_scale` | Sets tare to 0g, updates telemetry panel |
-| `2` | `calculate_yield` | Logs 75% yield (2200g → 1650g) |
-| `3` | `verify_pan_depth` | 15% fill → **warning** reticle |
-| `4` | `record_waste` | 450g Pork Collar → **ALERT** reticle |
+| Key | What it does |
+|-----|--------------|
+| `1` `2` `3` `4` | Load demo photo 1–4 (clears the previous photo's reticles) |
+| `S` | Snapshot: the HUD draws reticles on the loaded photo |
+| `V` | One voice command: plays the next line of a 7-line script |
+| `T` | Pin / unpin the **ledger card** (it also pops up for 8 s on every new entry) |
+| `0` | Clear the HUD |
 
-Press **`T`** → Telemetry panel slides out (right side) showing:
-- Live inventory balances
-- Waste & Yield logs
-- Active tare / container
-- Ledger save status
+A good first run: press **`S`** on photo 1 (six prep containers → `1/6 PAN` reticles, one
+warning, one breach), then press **`V`** a few times and watch the ledger card fill.
 
-Press **`0`** to clear all reticles.
+| Photo | Scene | Reticles |
+|-------|-------|----------|
+| `1` | Six prep containers | 1/6 pans of jalapenos, black olives, salsa, plus diced onion |
+| `2` | Seasoned tri-tip on a sheet pan | TRI-TIP A / B / C |
+| `3` | Pork roast on a cutting board | PORK ROAST |
+| `4` | Pulled pork in a half pan | 1/2 PAN — PULLED PORK |
+
+The photos live in `harness/webmcp/public/demo-frames/` (`scene-1.jpg` … `scene-4.jpg`); their
+reticles are in `harness/webmcp/mock-device-kit/mockScenes.json`. Full details, the voice script
+and how to add a photo are in the **Demo scenes** section of [`README.md`](README.md).
 
 ---
 
-## Test SAM 3.1 Snapshot (Press `S`)
+## Turn On the Kitchen Ledger (two terminals)
 
-Requires the mock server running:
+The reticles and voice need no server. The **ledger** does: each voice command is saved through
+the proxy. Run both from the **repository root**.
 
 ```bash
-# Terminal 2
-cd LineCheck-Vision-Hackathon/harness
-node mock-server.mjs
-# Listening on http://127.0.0.1:8787
+# Terminal 2: local mock upstream (http://127.0.0.1:8787)
+node harness/mock-server.mjs
+
+# Terminal 3: the proxy (http://127.0.0.1:8790)
+UPSTREAM_BASE=http://127.0.0.1:8787 META_API_KEY=local-test-token node harness/proxy-server.mjs
 ```
 
-Create `harness/webmcp/.env.local`:
+PowerShell: set `$env:UPSTREAM_BASE = "http://127.0.0.1:8787"` and
+`$env:META_API_KEY = "local-test-token"` first. `local-test-token` is a throwaway string the mock
+server checks, not a real credential.
+
+Now press **`V`**. A row appears in the ledger card, for example `PAN 1/6 Pan 95%` or
+`WASTE Pork Roast -450g Fat cap trim`.
+
+```bash
+curl http://127.0.0.1:8790/__kitchen/state     # full kitchen ledger (waste, yield, pan checks)
+curl http://127.0.0.1:8790/__usage             # spend ledger
+curl -X POST http://127.0.0.1:8790/__kitchen/reset   # empty the kitchen ledger
+```
+
+---
+
+## The Four Kitchen Tools, Directly (Shift + 1–4)
+
+These run a tool on the HUD without the voice chain, and do not write to the ledger.
+
+| Key | Tool | What happens |
+|-----|------|--------------|
+| `Shift+1` | `tare_scale` | Sets the tare |
+| `Shift+2` | `calculate_yield` | 75% yield (2200 g → 1650 g) |
+| `Shift+3` | `verify_pan_depth` | 15% fill → **warning** reticle |
+| `Shift+4` | `record_waste` | 450 g Pork Collar → **ALERT** reticle |
+
+---
+
+## Exercise the Real Fetch Path (optional)
+
+This leaves mock mode and sends real HTTP requests to the mock server. With
+`node harness/mock-server.mjs` running, create `harness/webmcp/.env.local`:
+
 ```env
 VITE_USE_MOCK_META=false
 VITE_META_API_KEY=local-test-token
@@ -52,43 +94,20 @@ VITE_SAM_MODEL_ENDPOINT=http://127.0.0.1:8787/sam-3.1/segment
 VITE_MUSE_AUDIO_ENDPOINT=http://127.0.0.1:8787/muse-audio/transcribe
 ```
 
-Restart `npm run dev`. Press **`S`** — HUD renders 4 detection boxes:
-- ✅ Hotel Pan 68% nominal
-- ⚠️ Salmon Trim 12% **warning**
-- ✅ Scale Tare 55%
-- 📏 Overflow (clamped to canvas edge)
-
----
-
-## Test Voice Chain (Press `V` or `M`)
-
-- `V` — synthetic audio, instant
-- `M` — real 2.2s mic capture (falls back to synthetic)
-
-Flow: Audio → Muse Transcribe → Spark Tool Pick → WebMCP Execute → Kitchen Ledger.
-
----
-
-## Run Full Stack (Proxy + Budget + Fallback)
-
-```bash
-# Terminal 3: Proxy with budget enforcement
-cd harness
-META_API_KEY=local-test-token UPSTREAM_BASE=http://127.0.0.1:8787 node proxy-server.mjs
-# http://127.0.0.1:8790
-
-# Check spend ledger
-curl http://127.0.0.1:8790/__usage
-```
+Restart `npm run dev` and press **`S`**: the HUD draws the mock server's generic boxes (hotel pan,
+salmon trim, scale zone, an overflow box clamped to the canvas edge) rather than the photo's.
 
 ---
 
 ## Run Tests (CI Gate)
 
 ```bash
-cd harness
-node --test tests/proxy-fallback.test.mjs
-# ✅ 11/11 pass: failover, budget, circuit breaker, tier routing, cache
+cd harness/webmcp
+npm test                                    # 50 assertions: coordinates, wake word, tiers, tools
+
+cd ../..
+node --test harness/tests/proxy-fallback.test.mjs
+# 11/11 pass: failover, budget, circuit breaker, tier routing, cache
 ```
 
 ---
@@ -108,19 +127,21 @@ Rate limit: 60 req/min (KV token bucket)
 
 ```
 LineCheck-Vision-Hackathon/
-├── README.md                    ← This guide + architecture diagrams
+├── README.md                    ← Architecture diagrams, demo scenes, env contracts
 ├── AGENTS.md                    ← Contribution boundaries
 ├── harness/
 │   ├── mock-server.mjs          ← Local contract server (no deps)
-│   ├── proxy-server.mjs         ← Key proxy + budget + cache + tiers
+│   ├── proxy-server.mjs         ← Key proxy + budget + cache + tiers + kitchen ledger
 │   ├── tests/proxy-fallback.test.mjs
 │   ├── webmcp/                  ← 600×600 HUD (TypeScript + Vite)
-│   │   ├── src/main.ts          ← Canvas loop, hotkeys, snapshots
+│   │   ├── src/main.ts          ← Canvas loop, hotkeys, photo scenes, ledger card
 │   │   ├── src/hud/state.ts     ← Reactive HUDStore
 │   │   ├── src/mcp/normalize.ts ← 1280×720 → 600×600 clamp
 │   │   ├── src/mcp/tools.ts     ← 4 WebMCP tools + dispatch
-│   │   ├── src/mcp/client.ts    ← MetaModelClient (mock/live)
-│   │   └── src/mic.ts           ← Bounded 2.2s capture
+│   │   ├── src/mcp/client.ts    ← MetaModelClient (mock/live) + voice script
+│   │   ├── src/mic.ts           ← Bounded 2.2s capture
+│   │   ├── mock-device-kit/     ← mockScenes.json (per-photo boxes), mockDetections.json
+│   │   └── public/demo-frames/  ← scene-1.jpg … scene-4.jpg
 │   └── README.md                ← Contracts, injection, security
 ├── fallback/
 │   ├── worker/                  ← Cloudflare Worker + Workers AI
@@ -136,6 +157,9 @@ LineCheck-Vision-Hackathon/
 | Component | Status |
 |-----------|--------|
 | HUD canvas, store, 4 tools | ✅ Working |
+| Demo photo scenes + per-photo reticles | ✅ Working (mock mode) |
+| Scripted voice demo + kitchen ledger card | ✅ Working (mock mode) |
+| Kitchen ledger (proxy-side, persisted to `.cache/`) | ✅ Working |
 | Coordinate normalization + clamping | ✅ Tested |
 | Snapshot/voice throttling + in-flight guards | ✅ Working |
 | Mic capture + graceful fallback | ✅ Working |
