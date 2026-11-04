@@ -652,14 +652,15 @@ async function triggerVoice(hint?: string) {
     console.log('[HUD] 3/3 execute', picked.toolCall.name, JSON.stringify(picked.toolCall.arguments));
     const toolResult = await executeTool(picked.toolCall.name, picked.toolCall.arguments);
     
-    // Log to kitchen ledger via proxy
+    // Log to kitchen ledger via proxy ('target' only steers which reticle the HUD marks)
+    const { target: _target, ...ledgerArgs } = picked.toolCall.arguments as Record<string, unknown>;
     try {
       const logResp = await fetch(`${PROXY_BASE}/__kitchen/log`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: picked.toolCall.name,
-          ...picked.toolCall.arguments,
+          ...ledgerArgs,
         }),
       });
       if (logResp.ok) {

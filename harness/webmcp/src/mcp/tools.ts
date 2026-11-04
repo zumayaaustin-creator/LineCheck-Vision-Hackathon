@@ -4,12 +4,15 @@ export interface RecordWasteParams {
   ingredient: string;
   weight_g: number;
   reason: string;
+  /** reticle to annotate in place (case-insensitive label match); omit for the generic overlay box */
+  target?: string;
 }
 
 export interface CalculateYieldParams {
   ap_weight_g: number;
   ep_weight_g: number;
   trim_weight_g?: number;
+  target?: string;
 }
 
 export interface TareScaleParams {
@@ -19,10 +22,39 @@ export interface TareScaleParams {
 export interface VerifyPanDepthParams {
   pan_type: string;
   fill_percentage: number;
+  target?: string;
+}
+
+/**
+ * Annotate the reticle(s) already on the photo instead of replacing the whole set with one fixed
+ * box. A label is "<base> | <result>": the base never changes, so repeating a command rewrites the
+ * result rather than stacking text. Returns how many reticles matched.
+ */
+function annotateTarget(
+  target: string,
+  result: string,
+  status: Reticle['status'],
+  all = false,
+): number {
+  const key = target.toUpperCase();
+  const current = hudStore.getState().reticles;
+  let hits = 0;
+  const next = current.map((r) => {
+    if (!r.label.toUpperCase().includes(key) || (!all && hits > 0)) return r;
+    hits += 1;
+    return { ...r, label: `${r.label.split(' | ')[0]} | ${result}`, status };
+  });
+  if (hits > 0) hudStore.setReticles(next);
+  return hits;
 }
 
 export function record_waste(params: RecordWasteParams) {
   hudStore.setStatus('ALERT');
+  if (params.target) {
+    // targeted call: mark the item on the photo (or nothing, if it is not on screen) - no stray box
+    annotateTarget(params.target, `WASTE ${params.weight_g}g (${params.reason})`, 'breach');
+    return { success: true, logged_g: params.weight_g, code: 'WASTE_LOGGED' };
+  }
   const alertReticle: Reticle = {
     id: `waste-${Date.now()}`,
     x: 150,
@@ -40,6 +72,11 @@ export function record_waste(params: RecordWasteParams) {
 export function calculate_yield(params: CalculateYieldParams) {
   hudStore.setStatus('PROCESSING');
   const yieldPct = ((params.ep_weight_g / params.ap_weight_g) * 100).toFixed(1);
+  if (params.target) {
+    annotateTarget(params.target, `YIELD ${yieldPct}%`, 'nominal', true);
+    hudStore.setStatus('IDLE');
+    return { success: true, yield_percentage: Number(yieldPct) };
+  }
   const nominalReticle: Reticle = {
     id: `yield-${Date.now()}`,
     x: 140,
@@ -77,6 +114,10 @@ export function tare_scale(params: TareScaleParams) {
 export function verify_pan_depth(params: VerifyPanDepthParams) {
   const isWarning = params.fill_percentage < 20 || params.fill_percentage > 90;
   hudStore.setStatus(isWarning ? 'ALERT' : 'IDLE');
+  if (params.target) {
+    annotateTarget(params.target, `${params.fill_percentage}%`, isWarning ? 'breach' : 'nominal');
+    return { success: true, fill_percentage: params.fill_percentage, nominal: !isWarning };
+  }
   const panReticle: Reticle = {
     id: `pan-${Date.now()}`,
     x: 160,

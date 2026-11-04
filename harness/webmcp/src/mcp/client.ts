@@ -69,47 +69,48 @@ const MOCK_SCRIPT: Array<{
   actionRequired: string;
   toolCall: ToolCall;
 }> = [
+  // scene 1 (kitchen line) x4, then scene 3, scene 2, scene 4: three photo changes in the whole take
   {
     transcription: 'Check prep level on the diced onion',
     assistantReply: 'Diced onion at 95% in the 1/6 pan. Overfilled, pull some before it spills.',
     actionRequired: 'NOTIFY_PREP',
-    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 95 } },
-  },
-  {
-    transcription: 'Log pork roast trim, four hundred fifty grams, fat cap',
-    assistantReply: 'Logged 450 grams of pork roast trim as fat cap waste.',
-    actionRequired: 'LOG_WASTE',
-    toolCall: { name: 'record_waste', arguments: { ingredient: 'Pork Roast', weight_g: 450, reason: 'Fat cap trim' } },
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 95, target: 'DICED ONION' } },
   },
   {
     transcription: 'Check the jalapeno pan',
     assistantReply: 'Jalapenos at 55% in the 1/6 pan. Fine for now.',
     actionRequired: 'NOTIFY_PREP',
-    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 55 } },
-  },
-  {
-    transcription: 'Yield on the tri-tip, twenty-two hundred purchased, sixteen fifty edible',
-    assistantReply: 'Tri-tip yield is 75 percent: 1650 grams edible from 2200 purchased.',
-    actionRequired: 'LOG_YIELD',
-    toolCall: { name: 'calculate_yield', arguments: { ap_weight_g: 2200, ep_weight_g: 1650, trim_weight_g: 550 } },
-  },
-  {
-    transcription: 'Check the black olives',
-    assistantReply: 'Black olives at 80% in the 1/6 pan.',
-    actionRequired: 'NOTIFY_PREP',
-    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 80 } },
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 55, target: 'JALAPENOS' } },
   },
   {
     transcription: 'Log salsa waste, three hundred grams, expired',
     assistantReply: 'Logged 300 grams of salsa as expired.',
     actionRequired: 'LOG_WASTE',
-    toolCall: { name: 'record_waste', arguments: { ingredient: 'Salsa', weight_g: 300, reason: 'Expired' } },
+    toolCall: { name: 'record_waste', arguments: { ingredient: 'Salsa', weight_g: 300, reason: 'Expired', target: 'SALSA' } },
+  },
+  {
+    transcription: 'Check the black olives',
+    assistantReply: 'Black olives at 80% in the 1/6 pan.',
+    actionRequired: 'NOTIFY_PREP',
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/6 Pan', fill_percentage: 80, target: 'BLACK OLIVES' } },
+  },
+  {
+    transcription: 'Log pork roast trim, four hundred fifty grams, fat cap',
+    assistantReply: 'Logged 450 grams of pork roast trim as fat cap waste.',
+    actionRequired: 'LOG_WASTE',
+    toolCall: { name: 'record_waste', arguments: { ingredient: 'Pork Roast', weight_g: 450, reason: 'Fat cap trim', target: 'PORK ROAST' } },
+  },
+  {
+    transcription: 'Yield on the tri-tip, twenty-two hundred purchased, sixteen fifty edible',
+    assistantReply: 'Tri-tip yield is 75 percent: 1650 grams edible from 2200 purchased.',
+    actionRequired: 'LOG_YIELD',
+    toolCall: { name: 'calculate_yield', arguments: { ap_weight_g: 2200, ep_weight_g: 1650, trim_weight_g: 550, target: 'TRI-TIP' } },
   },
   {
     transcription: 'Check the pulled pork half pan',
     assistantReply: 'Pulled pork at 90% in the half pan. Full, hold it hot.',
     actionRequired: 'NOTIFY_PREP',
-    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/2 Pan', fill_percentage: 90 } },
+    toolCall: { name: 'verify_pan_depth', arguments: { pan_type: '1/2 Pan', fill_percentage: 90, target: 'PULLED PORK' } },
   },
 ];
 
